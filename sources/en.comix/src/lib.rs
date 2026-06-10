@@ -512,6 +512,20 @@ impl PageImageProcessor for Comix {
 		response: ImageResponse,
 		context: Option<PageContext>,
 	) -> Result<ImageRef> {
+		if let (Some(seed_str), Some(len_str)) = (
+			response.headers.get("x-enc-seed"),
+			response.headers.get("x-enc-len"),
+		) {
+			if let (Ok(seed), Ok(length)) = (seed_str.parse::<u64>(), len_str.parse::<usize>()) {
+				let seed_i32 = seed as i32;
+				if seed_i32 != 0 && length > 0 {
+					let mut image_data = response.image.data().to_vec();
+					helpers::decode_encoded_prefix(&mut image_data, seed_i32, length);
+					return Ok(ImageRef::new(&image_data));
+				}
+			}
+		}
+
 		if let Some(context) = context {
 			if context.get("s").is_some_and(|s| s == "1") {
 				let Some(url) = response.request.url else {

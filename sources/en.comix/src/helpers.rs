@@ -80,3 +80,23 @@ pub fn parse_relative_date_string(string: &str) -> i64 {
 
 	now - seconds
 }
+
+pub fn decode_encoded_prefix(data: &mut [u8], seed: i32, length: usize) {
+    const ENC_MULTIPLIER: i32 = 1000005;
+    const ENC_INCREMENT: i32 = 1234567891;
+    const CHUNK_SIZE: usize = 8192;
+    
+    let mut state = seed;
+    let mut decoded = 0;
+
+    while decoded < length.min(data.len()) {
+        let chunk_end = (decoded + CHUNK_SIZE).min(length).min(data.len());
+        
+        for i in decoded..chunk_end {
+            state = state.wrapping_mul(ENC_MULTIPLIER).wrapping_add(ENC_INCREMENT);
+            data[i] ^= ((state as u32) >> 24) as u8;
+        }
+        
+        decoded = chunk_end;
+    }
+}
