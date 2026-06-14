@@ -57,21 +57,6 @@ return r;};\
 })();\
 </script>";
 
-// Captures a single manga detail: result.hid is a string and result has no items array.
-const MANGA_DETAIL_PROXY_INLINE: &str = "\
-<script>\
-(function(){\
-if(window.__comixMangaDetailData)return;\
-var _o=JSON.parse;\
-JSON.parse=function(){\
-var r=_o.apply(this,arguments);\
-try{\
-if(r&&r.result&&typeof r.result.hid==='string'&&!r.result.items)\
-window.__comixMangaDetailData=JSON.stringify(r);\
-}catch(e){}\
-return r;};\
-})();\
-</script>";
 
 /// Fetches the HTML for `page_url`, injects a JSON.parse proxy script into `<head>`,
 /// loads it into a WebView, then polls until the proxy captures data or a JS timeout fires.
@@ -143,8 +128,43 @@ pub fn fetch_manga_list_data(browse_url: &str) -> Result<String> {
 }
 
 pub fn fetch_manga_detail_data(title_url: &str) -> Result<String> {
-	println!("[comix] fetch_manga_detail_data: {title_url}");
-	load_and_capture(title_url, MANGA_DETAIL_PROXY_INLINE, "__comixMangaDetailData")
+	let html = Request::get(title_url)?
+		.header(
+			"Accept",
+			"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		)
+		.header("Accept-Language", "en-US,en;q=0.9")
+		.header("Referer", &format!("{BASE_URL}/"))
+		.string()?;
+
+	// comix.to embeds all page data in <script id="initial-data"> as JSON.
+	// The queries object holds React Query cache entries; the detail entry key
+	// is a serialized JSON array like ["detail","<hid>"] so it contains "detail".
+	let json_text = extract_initial_data(&html)
+		.ok_or(error!("No initial-data script on {title_url}"))?;
+
+	let root: serde_json::Value =
+		serde_json::from_str(json_text).map_err(|e| error!("initial-data parse failed: {e}"))?;
+
+	let queries = root["queries"]
+		.as_object()
+		.ok_or(error!("No queries in initial-data for {title_url}"))?;
+
+	let detail = queries
+		.iter()
+		.find(|(k, _)| k.contains("\"detail\""))
+		.map(|(_, v)| v)
+		.ok_or(error!("No detail query in initial-data for {title_url}"))?;
+
+	// The query value is the bare ComixManga; wrap to match SingleMangaResponse.
+	Ok(format!("{{\"result\":{detail}}}"))
+}
+
+fn extract_initial_data(html: &str) -> Option<&str> {
+	let id_pos = html.find("id=\"initial-data\"")?;
+	let tag_end = id_pos + html[id_pos..].find('>')? + 1;
+	let close = html[tag_end..].find("</script>")?;
+	Some(html[tag_end..tag_end + close].trim())
 }
 
 const GET_VMOBJ_JS: &str = "\
