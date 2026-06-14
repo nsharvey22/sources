@@ -58,10 +58,6 @@ pub struct ChapterResponse {
 	pub result: Option<ComixChapterWithPages>,
 }
 
-#[derive(Deserialize)]
-pub struct TermResponse {
-	pub result: TermItems,
-}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,12 +99,6 @@ impl From<MangaItems> for MangaPageResult {
 pub struct ChapterItems {
 	pub items: Vec<ComixChapter>,
 	pub meta: Pagination,
-}
-
-#[derive(Deserialize)]
-pub struct TermItems {
-	pub items: Vec<Term>,
-	// pub pagination: Pagination,
 }
 
 #[derive(Deserialize)]
