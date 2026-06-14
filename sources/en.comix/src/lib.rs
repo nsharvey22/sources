@@ -8,15 +8,15 @@ use aidoku::{
 	ListingProvider, Manga, MangaPageResult, MangaWithChapter, NotificationHandler, Page,
 	PageContent, PageContext, PageImageProcessor, Result, Source,
 	alloc::{String, Vec, string::ToString, vec},
-	helpers::uri::{QueryParameters, encode_uri_component},
+	helpers::uri::QueryParameters,
 	imports::{
-		net::{Request, RequestError, Response},
+		net::Request,
 		std::send_partial_result,
 	},
 	prelude::*,
 };
-use base64::{Engine, engine::general_purpose};
 
+mod descramble;
 mod helpers;
 mod models;
 mod settings;
@@ -25,9 +25,7 @@ mod web;
 use models::*;
 
 const BASE_URL: &str = "https://comix.to";
-const API_URL: &str = "https://comix.to/api/v1";
 
-const CONTENT_TYPES: &[&str] = &["manga", "manhwa", "manhua", "other"];
 // adult, boys love, ecchi, girls love, hentai, smut
 const NSFW_GENRE_IDS: &[&str] = &["87264", "8", "87265", "13", "87266", "87268"];
 
@@ -47,7 +45,7 @@ impl Source for Comix {
 		let mut qs = QueryParameters::new();
 		qs.push("page", Some(&page.to_string()));
 		if query.is_some() {
-			qs.push("keyword", query.as_deref());
+			qs.push("q", query.as_deref());
 		}
 
 		let mut hidden_types = {
@@ -60,49 +58,29 @@ impl Source for Comix {
 
 		for filter in filters {
 			match filter {
-				FilterValue::Text { id, value } => {
-					let url = format!(
-						"{API_URL}/terms?type={id}&keyword={}&limit=1",
-						encode_uri_component(value)
-					);
-					let id = Request::get(url)?
-						.json_owned::<TermResponse>()?
-						.result
-						.items
-						.first()
-						.map(|t| t.id)
-						.ok_or_else(|| error!("No matching {id}s"))?;
-					qs.push(&format!("{id}s[]"), Some(&id.to_string()));
+				FilterValue::Text { .. } => {
+					// Term lookups require a token-gated API endpoint; skip for now.
 				}
-				FilterValue::Sort {
-					id,
-					index,
-					ascending,
-				} => {
-					qs.push(
-						&format!(
-							"{id}[{}]",
-							match index {
-								0 => "relevance",
-								1 => "chapter_updated_at",
-								2 => "created_at",
-								3 => "title",
-								4 => "year",
-								5 => "score",
-								6 => "views_7d",
-								7 => "views_30d",
-								8 => "views_90d",
-								9 => "views_total",
-								10 => "follows_total",
-								_ => "relevance",
-							}
-						),
-						Some(if (index == 3 && !ascending) || (index != 3 && ascending) {
-							"asc"
-						} else {
-							"desc"
-						}),
-					);
+				FilterValue::Sort { index, ascending, .. } => {
+					// index 1 = "Latest Updates" — no sort param, just omit it.
+					let field = match index {
+						0 => "relevance",
+						1 => "",
+						2 => "created_at",
+						3 => "title",
+						4 => "year",
+						5 => "score",
+						6 => "views_7d",
+						7 => "views_30d",
+						8 => "views_90d",
+						9 => "views_total",
+						10 => "follows_total",
+						_ => "relevance",
+					};
+					if !field.is_empty() {
+						let dir = if ascending { "asc" } else { "desc" };
+						qs.push("sort", Some(&format!("{field}:{dir}")));
+					}
 					has_sort_filter = true;
 				}
 				FilterValue::Select { id, value } => {
@@ -113,12 +91,10 @@ impl Source for Comix {
 					included,
 					excluded,
 				} => {
-					// if any content type is set manually, skip our content type filters
 					if id == "types[]" {
 						hidden_types = None;
 					}
 					for value in included {
-						// if a hidden term is manually included in filters, skip hiding it
 						if id == "genres[]" {
 							let id_num = value.parse::<i32>().unwrap_or_default();
 							if let Some(pos) = hidden_terms.iter().position(|&x| x == id_num) {
@@ -131,12 +107,10 @@ impl Source for Comix {
 						}
 					}
 					for value in excluded {
-						// make sure hidden terms aren't added to query params twice
 						if id == "genres[]" {
 							if hidden_terms.contains(&value.parse().unwrap_or_default()) {
 								continue;
 							}
-
 							qs.push("genres_ex[]", Some(&value));
 						} else {
 							qs.push(&id, Some(&format!("-{value}")));
@@ -148,11 +122,11 @@ impl Source for Comix {
 		}
 
 		if !has_sort_filter {
-			qs.push("order[relevance]", Some("desc"));
+			qs.push("sort", Some("relevance:desc"));
 		}
 
 		if let Some(hidden_types) = hidden_types {
-			for &typ in CONTENT_TYPES {
+			for &typ in &["manga", "manhwa", "manhua", "other"] {
 				if !hidden_types.iter().any(|s| s.as_str() == typ) {
 					qs.push("types[]", Some(typ));
 				}
@@ -169,10 +143,15 @@ impl Source for Comix {
 			}
 		}
 
-		let url = format!("{API_URL}/manga?{qs}");
-		Request::get(url)?
-			.json_owned::<SearchResponse>()
-			.map(Into::into)
+		qs.push("content_rating", Some("suggestive"));
+
+		let url = format!("{BASE_URL}/browse?{qs}");
+		let raw = web::fetch_manga_list_data(&url)?;
+		let hidden_types = settings::hidden_types();
+		let hidden_terms = settings::hidden_terms();
+		serde_json::from_str::<SearchResponse>(&raw)
+			.map(|r| r.result.into_filtered(&hidden_types, &hidden_terms))
+			.map_err(|e| error!("{e}"))
 	}
 
 	fn get_manga_update(
@@ -182,46 +161,33 @@ impl Source for Comix {
 		needs_chapters: bool,
 	) -> Result<Manga> {
 		if needs_details {
-			let url = format!(
-				"{API_URL}/manga/{}/?includes[]=demographic\
-									&includes[]=genre\
-									&includes[]=theme\
-									&includes[]=author\
-									&includes[]=artist\
-									&includes[]=publisher",
-				manga.key
-			);
-			let json: SingleMangaResponse = Request::get(&url)?.json_owned()?;
-
+			let title_url = manga
+				.url
+				.clone()
+				.unwrap_or_else(|| format!("{BASE_URL}/title/{}", manga.key));
+			println!("[comix] get_manga_update: fetching details for {title_url}");
+			let raw = web::fetch_manga_detail_data(&title_url)?;
+			let json: SingleMangaResponse = serde_json::from_str(&raw)?;
 			manga.copy_from(json.result.into());
-
 			if needs_chapters {
 				send_partial_result(&manga);
 			}
 		}
 
 		if needs_chapters {
-			let limit = 100;
 			let mut page = 1;
 			let deduplicate = settings::dedupchapter();
 			let mut chapter_map: HashMap<String, ComixChapter> = HashMap::new();
 			let mut chapter_list: Vec<ComixChapter> = Vec::new();
 
-			let web_view = web::create_web_view()?;
-			let path = format!("/manga/{}/chapters", manga.key);
-			let token = web::get_token(&web_view, &path)?;
+			let manga_web_url = manga
+				.url
+				.clone()
+				.unwrap_or_else(|| format!("{BASE_URL}/title/{}", manga.key));
 
 			loop {
-				let url = format!(
-					"{API_URL}{path}\
-						?limit={limit}\
-						&page={page}\
-						&order[number]=desc\
-						&_={token}"
-				);
-
-				let encoded_res = Request::get(&url)?.string()?;
-				let result = web::decode_response(&web_view, &url, &encoded_res)?;
+				let page_url = format!("{manga_web_url}?page={page}");
+				let result = web::fetch_chapter_data(&page_url)?;
 				let res = serde_json::from_str::<ChapterDetailsResponse>(&result)?;
 
 				let items = res.result.items;
@@ -262,12 +228,12 @@ impl Source for Comix {
 	}
 
 	fn get_page_list(&self, _manga: Manga, chapter: Chapter) -> Result<Vec<Page>> {
-		let web_view = web::create_web_view()?;
-		let path = format!("/chapters/{}", chapter.key);
-		let token = web::get_token(&web_view, &path)?;
-		let url = format!("{API_URL}{path}?_={token}");
-		let encoded_res = Request::get(&url)?.string()?;
-		let result = web::decode_response(&web_view, &url, &encoded_res)?;
+		println!("[comix] get_page_list: key={} url={:?}", chapter.key, chapter.url);
+		let chapter_url = chapter
+			.url
+			.as_deref()
+			.ok_or_else(|| error!("Missing chapter URL"))?;
+		let result = web::fetch_page_list_data(chapter_url)?;
 		let json: ChapterResponse = serde_json::from_str(&result)?;
 
 		let Some(result) = json.result else {
@@ -289,8 +255,6 @@ impl Source for Comix {
 					content: if let Some(s) = page.s {
 						let mut context = PageContext::new();
 						context.insert("s".into(), s.to_string());
-						context.insert("width".into(), page.width.to_string());
-						context.insert("height".into(), page.height.to_string());
 						PageContent::url_context(url, context)
 					} else {
 						PageContent::url(url)
@@ -304,31 +268,7 @@ impl Source for Comix {
 
 impl Home for Comix {
 	fn get_home(&self) -> Result<HomeLayout> {
-		// send basic layout
-		send_partial_result(&HomePartialResult::Layout(HomeLayout {
-			components: vec![
-				HomeComponent {
-					title: Some("Most Recent Popular".into()),
-					subtitle: None,
-					value: aidoku::HomeComponentValue::empty_scroller(),
-				},
-				HomeComponent {
-					title: Some("Most Follows New Comics".into()),
-					subtitle: None,
-					value: aidoku::HomeComponentValue::empty_scroller(),
-				},
-				HomeComponent {
-					title: Some("Latest Updates (Hot)".into()),
-					subtitle: None,
-					value: aidoku::HomeComponentValue::empty_scroller(),
-				},
-				HomeComponent {
-					title: Some("Recently Added".into()),
-					subtitle: None,
-					value: aidoku::HomeComponentValue::empty_manga_chapter_list(),
-				},
-			],
-		}));
+		println!("[comix] get_home: called");
 
 		let extra_qs = if settings::hide_nsfw() {
 			NSFW_GENRE_IDS
@@ -342,97 +282,120 @@ impl Home for Comix {
 		let hidden_types = settings::hidden_types();
 		let hidden_terms = settings::hidden_terms();
 
-		let responses: [core::result::Result<Response, RequestError>; 4] = Request::send_all([
-			// most recent popular
-			Request::get(format!(
-				"{API_URL}/manga/top?type=trending&days=1&limit=20{extra_qs}"
-			))?,
-			// most follows new comics
-			Request::get(format!(
-				"{API_URL}/manga/top?type=follows&days=1&limit=20{extra_qs}"
-			))?,
-			// latest updates (hot)
-			Request::get(format!(
-				"{API_URL}/manga?scope=hot&limit=30&order[chapter_updated_at]=desc&page=1{extra_qs}"
-			))?,
-			// recently added
-			Request::get(format!(
-				"{API_URL}/manga?order[created_at]=desc&limit=10&page=1{extra_qs}"
-			))?,
-		])
-		.try_into()
-		.expect("requests vec length should be 4");
+		// (title, browse query params, is_chapter_list_style)
+		let browse_sections: &[(&str, &str, bool)] = &[
+			("Popular", "sort=score:desc&limit=20&content_rating=suggestive", false),
+			(
+				"Most Followed",
+				"sort=follows_total:desc&limit=20&content_rating=suggestive",
+				false,
+			),
+			// Latest Updates uses no sort param per comix.to browse conventions.
+			("Latest Updates", "limit=20&content_rating=suggestive", false),
+			(
+				"Hot Webtoons",
+				"types[]=manhwa&scope=hot&limit=20&content_rating=suggestive",
+				false,
+			),
+			(
+				"Recently Added",
+				"sort=created_at:desc&limit=10&content_rating=suggestive",
+				true,
+			),
+		];
 
-		let [popular_res, follows_res, latest_res, recent_res] = responses;
-
-		for (response, title) in [
-			(popular_res, "Most Recent Popular"),
-			(follows_res, "Most Follows New Comics"),
-			(latest_res, "Latest Updates (Hot)"),
-		] {
-			let entries = response?
-				.get_json::<SearchResponse>()?
-				.result
-				.items
-				.into_iter()
-				.filter(|m| !m.is_hidden(&hidden_types, &hidden_terms))
-				.map(|m| {
-					let manga = Manga::from(m);
-					Link {
-						title: manga.title.clone(),
-						subtitle: None,
-						image_url: manga.cover.clone(),
-						value: Some(LinkValue::Manga(manga)),
-					}
+		// Send initial layout with empty placeholders.
+		send_partial_result(&HomePartialResult::Layout(HomeLayout {
+			components: browse_sections
+				.iter()
+				.map(|(title, _, is_list)| HomeComponent {
+					title: Some((*title).into()),
+					subtitle: None,
+					value: if *is_list {
+						aidoku::HomeComponentValue::empty_manga_chapter_list()
+					} else {
+						aidoku::HomeComponentValue::empty_scroller()
+					},
 				})
-				.collect();
-			send_partial_result(&HomePartialResult::Component(HomeComponent {
-				title: Some(title.into()),
-				subtitle: None,
-				value: aidoku::HomeComponentValue::Scroller {
-					entries,
-					listing: Some(Listing {
-						id: title.into(),
-						name: title.into(),
-						..Default::default()
-					}),
-				},
-			}));
-		}
+				.collect(),
+		}));
 
-		{
-			let entries = recent_res?
-				.get_json::<SearchResponse>()?
-				.result
-				.items
-				.into_iter()
-				.filter(|m| !m.is_hidden(&hidden_types, &hidden_terms))
-				.map(|m| {
-					let chapter_number = m.latest_chapter;
-					let manga = Manga::from(m);
-					MangaWithChapter {
-						manga,
-						chapter: Chapter {
-							chapter_number,
+		for (title, params, is_list) in browse_sections {
+			let url = format!("{BASE_URL}/browse?{params}{extra_qs}");
+			let raw = match web::fetch_manga_list_data(&url) {
+				Ok(r) => r,
+				Err(e) => {
+					println!("[comix] get_home: failed to load '{title}': {e:?}");
+					continue;
+				}
+			};
+			let items = match serde_json::from_str::<SearchResponse>(&raw) {
+				Ok(r) => r
+					.result
+					.items
+					.into_iter()
+					.filter(|m| !m.is_hidden(&hidden_types, &hidden_terms))
+					.collect::<Vec<_>>(),
+				Err(e) => {
+					println!("[comix] get_home: parse error for '{title}': {e}");
+					continue;
+				}
+			};
+
+			if *is_list {
+				let entries = items
+					.into_iter()
+					.map(|m| {
+						let chapter_number = m.latest_chapter;
+						let manga = Manga::from(m);
+						MangaWithChapter {
+							manga,
+							chapter: Chapter {
+								chapter_number,
+								..Default::default()
+							},
+						}
+					})
+					.collect();
+				send_partial_result(&HomePartialResult::Component(HomeComponent {
+					title: Some((*title).into()),
+					subtitle: None,
+					value: aidoku::HomeComponentValue::MangaChapterList {
+						page_size: None,
+						entries,
+						listing: Some(Listing {
+							id: (*title).into(),
+							name: (*title).into(),
 							..Default::default()
-						},
-					}
-				})
-				.collect();
-			let title = "Recently Added";
-			send_partial_result(&HomePartialResult::Component(HomeComponent {
-				title: Some(title.into()),
-				subtitle: None,
-				value: aidoku::HomeComponentValue::MangaChapterList {
-					page_size: None,
-					entries,
-					listing: Some(Listing {
-						id: title.into(),
-						name: title.into(),
-						..Default::default()
-					}),
-				},
-			}));
+						}),
+					},
+				}));
+			} else {
+				let entries = items
+					.into_iter()
+					.map(|m| {
+						let manga = Manga::from(m);
+						Link {
+							title: manga.title.clone(),
+							subtitle: None,
+							image_url: manga.cover.clone(),
+							value: Some(LinkValue::Manga(manga)),
+						}
+					})
+					.collect();
+				send_partial_result(&HomePartialResult::Component(HomeComponent {
+					title: Some((*title).into()),
+					subtitle: None,
+					value: aidoku::HomeComponentValue::Scroller {
+						entries,
+						listing: Some(Listing {
+							id: (*title).into(),
+							name: (*title).into(),
+							..Default::default()
+						}),
+					},
+				}));
+			}
 		}
 
 		Ok(HomeLayout::default())
@@ -441,6 +404,17 @@ impl Home for Comix {
 
 impl ListingProvider for Comix {
 	fn get_manga_list(&self, listing: Listing, page: i32) -> Result<MangaPageResult> {
+		let extra_qs = if settings::hide_nsfw() {
+			NSFW_GENRE_IDS
+				.iter()
+				.map(|id| format!("&genres_ex[]={id}"))
+				.collect::<String>()
+		} else {
+			Default::default()
+		};
+		let hidden_types = settings::hidden_types();
+		let hidden_terms = settings::hidden_terms();
+
 		let trending = |types: Vec<String>| {
 			self.get_search_manga_list(
 				None,
@@ -460,41 +434,28 @@ impl ListingProvider for Comix {
 			)
 		};
 
-		fn get_listing_page(url: &str) -> Result<MangaPageResult> {
-			let extra_qs = if settings::hide_nsfw() {
-				NSFW_GENRE_IDS
-					.iter()
-					.map(|id| format!("&genres_ex[]={id}"))
-					.collect::<String>()
-			} else {
-				Default::default()
-			};
-			let hidden_types = settings::hidden_types();
-			let hidden_terms = settings::hidden_terms();
-			let url = format!("{url}{extra_qs}");
-			Request::get(url)?
-				.json_owned::<SearchResponse>()
+		let fetch_listing = |params: &str| -> Result<MangaPageResult> {
+			let url = format!("{BASE_URL}/browse?{params}&page={page}{extra_qs}");
+			let raw = web::fetch_manga_list_data(&url)?;
+			serde_json::from_str::<SearchResponse>(&raw)
 				.map(|r| r.result.into_filtered(&hidden_types, &hidden_terms))
-		}
+				.map_err(|e| error!("{e}"))
+		};
 
 		match listing.id.as_str() {
 			"Trending Webtoon" => trending(vec!["manhua".into(), "manhwa".into()]),
 			"Trending Manga" => trending(vec!["manga".into()]),
-
-			"Most Recent Popular" => get_listing_page(&format!(
-				"{API_URL}/manga/top?type=trending&days=1&limit=50"
-			)),
-			"Most Follows New Comics" => {
-				get_listing_page(&format!("{API_URL}/manga/top?type=follows&days=1&limit=50"))
+			"Popular" => fetch_listing("sort=score:desc&limit=30&content_rating=suggestive"),
+			"Most Followed" => {
+				fetch_listing("sort=follows_total:desc&limit=30&content_rating=suggestive")
 			}
-
-			"Latest Updates (Hot)" => get_listing_page(&format!(
-				"{API_URL}/manga?scope=hot&limit=30&order[chapter_updated_at]=desc&page={page}"
-			)),
-			"Recently Added" => get_listing_page(&format!(
-				"{API_URL}/manga?order[created_at]=desc&limit=30&page={page}"
-			)),
-
+			"Latest Updates" => fetch_listing("limit=30&content_rating=suggestive"),
+			"Hot Webtoons" => {
+				fetch_listing("types[]=manhwa&scope=hot&limit=30&content_rating=suggestive")
+			}
+			"Recently Added" => {
+				fetch_listing("sort=created_at:desc&limit=30&content_rating=suggestive")
+			}
 			_ => bail!("Unknown listing"),
 		}
 	}
@@ -512,38 +473,82 @@ impl PageImageProcessor for Comix {
 		response: ImageResponse,
 		context: Option<PageContext>,
 	) -> Result<ImageRef> {
-		if let Some(context) = context {
-			if context.get("s").is_some_and(|s| s == "1") {
-				let Some(url) = response.request.url else {
-					bail!("Unable to get the image url")
-				};
+		// Only pages flagged with s=1 from the chapter API may need processing.
+		let is_scrambled = context
+			.as_ref()
+			.and_then(|c| c.get("s"))
+			.is_some_and(|s| s != "0");
+		if !is_scrambled {
+			return Ok(response.image);
+		}
 
-				let Some(width) = context.get("width").and_then(|s| s.parse::<f32>().ok()) else {
-					bail!("Unable to get the image width")
-				};
+		// Read encoding / scramble settings from the HTTP response headers.
+		let enc_seed = header_i32(&response.headers, "x-enc-seed");
+		let enc_len = header_usize(&response.headers, "x-enc-len");
+		let enc_algo = header_str(&response.headers, "x-enc-algo");
+		let scramble_seed = header_i32(&response.headers, "x-scramble-seed");
+		let scramble_grid = header_str(&response.headers, "x-scramble-grid");
+		let scramble_algo = header_str(&response.headers, "x-scramble-algo");
 
-				let Some(height) = context.get("height").and_then(|s| s.parse::<f32>().ok()) else {
-					bail!("Unable to get the image height")
-				};
+		let needs_xor = enc_seed.map(|s| s != 0).unwrap_or(false) && enc_len.is_some();
+		let should_descramble = scramble_grid.as_deref() == Some("5x5")
+			&& scramble_seed.map(|s| s != 0).unwrap_or(false)
+			&& matches!(
+				scramble_algo.as_deref(),
+				None | Some("1") | Some("2") | Some("3")
+			);
 
-				let web_view = web::create_web_view()?;
+		if !needs_xor && !should_descramble {
+			return Ok(response.image);
+		}
 
-				let data_url = web::descramble_image(&web_view, width, height, url.as_ref())?;
-				let Some((_, base64_data)) = data_url.split_once(',') else {
-					bail!("Unable to get the raw image data")
-				};
-				let bytes: Vec<u8> = general_purpose::STANDARD
-					.decode(base64_data)
-					.or_else(|_| bail!("Invalid base64 data given"))?;
-
-				Ok(ImageRef::new(bytes.as_ref()))
-			} else {
-				Ok(response.image)
-			}
+		// When XOR encoding is in play the framework cannot decode the raw bytes
+		// as an image, so we re-fetch and XOR-decode them ourselves.
+		let image = if needs_xor {
+			let url = response.request.url.ok_or(error!("Missing image URL"))?;
+			let raw = Request::get(&url)?
+				.header("Referer", &format!("{BASE_URL}/"))
+				.data()?;
+			let decoded =
+				descramble::decode_xor(&raw, enc_seed.unwrap(), enc_len.unwrap(), enc_algo.as_deref());
+			ImageRef::new(&decoded)
 		} else {
-			Ok(response.image)
+			// No XOR: the framework already decoded a valid (but scrambled) image.
+			response.image
+		};
+
+		if should_descramble {
+			Ok(descramble::descramble_tiles(
+				&image,
+				scramble_seed.unwrap(),
+				scramble_algo.as_deref(),
+			))
+		} else {
+			Ok(image)
 		}
 	}
+}
+
+fn header_i32(headers: &HashMap<String, String>, name: &str) -> Option<i32> {
+	headers
+		.iter()
+		.find(|(k, _)| k.eq_ignore_ascii_case(name))
+		.and_then(|(_, v)| v.parse::<i64>().ok())
+		.map(|v| v as i32)
+}
+
+fn header_usize(headers: &HashMap<String, String>, name: &str) -> Option<usize> {
+	headers
+		.iter()
+		.find(|(k, _)| k.eq_ignore_ascii_case(name))
+		.and_then(|(_, v)| v.parse::<usize>().ok())
+}
+
+fn header_str(headers: &HashMap<String, String>, name: &str) -> Option<String> {
+	headers
+		.iter()
+		.find(|(k, _)| k.eq_ignore_ascii_case(name))
+		.map(|(_, v)| v.clone())
 }
 
 impl NotificationHandler for Comix {
