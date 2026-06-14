@@ -15,8 +15,8 @@ use aidoku::{
 	},
 	prelude::*,
 };
-use base64::{Engine, engine::general_purpose};
 
+mod descramble;
 mod helpers;
 mod models;
 mod settings;
@@ -255,8 +255,6 @@ impl Source for Comix {
 					content: if let Some(s) = page.s {
 						let mut context = PageContext::new();
 						context.insert("s".into(), s.to_string());
-						context.insert("width".into(), page.width.to_string());
-						context.insert("height".into(), page.height.to_string());
 						PageContent::url_context(url, context)
 					} else {
 						PageContent::url(url)
@@ -475,38 +473,82 @@ impl PageImageProcessor for Comix {
 		response: ImageResponse,
 		context: Option<PageContext>,
 	) -> Result<ImageRef> {
-		if let Some(context) = context {
-			if context.get("s").is_some_and(|s| s == "1") {
-				let Some(url) = response.request.url else {
-					bail!("Unable to get the image url")
-				};
+		// Only pages flagged with s=1 from the chapter API may need processing.
+		let is_scrambled = context
+			.as_ref()
+			.and_then(|c| c.get("s"))
+			.is_some_and(|s| s != "0");
+		if !is_scrambled {
+			return Ok(response.image);
+		}
 
-				let Some(width) = context.get("width").and_then(|s| s.parse::<f32>().ok()) else {
-					bail!("Unable to get the image width")
-				};
+		// Read encoding / scramble settings from the HTTP response headers.
+		let enc_seed = header_i32(&response.headers, "x-enc-seed");
+		let enc_len = header_usize(&response.headers, "x-enc-len");
+		let enc_algo = header_str(&response.headers, "x-enc-algo");
+		let scramble_seed = header_i32(&response.headers, "x-scramble-seed");
+		let scramble_grid = header_str(&response.headers, "x-scramble-grid");
+		let scramble_algo = header_str(&response.headers, "x-scramble-algo");
 
-				let Some(height) = context.get("height").and_then(|s| s.parse::<f32>().ok()) else {
-					bail!("Unable to get the image height")
-				};
+		let needs_xor = enc_seed.map(|s| s != 0).unwrap_or(false) && enc_len.is_some();
+		let should_descramble = scramble_grid.as_deref() == Some("5x5")
+			&& scramble_seed.map(|s| s != 0).unwrap_or(false)
+			&& matches!(
+				scramble_algo.as_deref(),
+				None | Some("1") | Some("2") | Some("3")
+			);
 
-				let web_view = web::create_web_view()?;
+		if !needs_xor && !should_descramble {
+			return Ok(response.image);
+		}
 
-				let data_url = web::descramble_image(&web_view, width, height, url.as_ref())?;
-				let Some((_, base64_data)) = data_url.split_once(',') else {
-					bail!("Unable to get the raw image data")
-				};
-				let bytes: Vec<u8> = general_purpose::STANDARD
-					.decode(base64_data)
-					.or_else(|_| bail!("Invalid base64 data given"))?;
-
-				Ok(ImageRef::new(bytes.as_ref()))
-			} else {
-				Ok(response.image)
-			}
+		// When XOR encoding is in play the framework cannot decode the raw bytes
+		// as an image, so we re-fetch and XOR-decode them ourselves.
+		let image = if needs_xor {
+			let url = response.request.url.ok_or(error!("Missing image URL"))?;
+			let raw = Request::get(&url)?
+				.header("Referer", &format!("{BASE_URL}/"))
+				.data()?;
+			let decoded =
+				descramble::decode_xor(&raw, enc_seed.unwrap(), enc_len.unwrap(), enc_algo.as_deref());
+			ImageRef::new(&decoded)
 		} else {
-			Ok(response.image)
+			// No XOR: the framework already decoded a valid (but scrambled) image.
+			response.image
+		};
+
+		if should_descramble {
+			Ok(descramble::descramble_tiles(
+				&image,
+				scramble_seed.unwrap(),
+				scramble_algo.as_deref(),
+			))
+		} else {
+			Ok(image)
 		}
 	}
+}
+
+fn header_i32(headers: &HashMap<String, String>, name: &str) -> Option<i32> {
+	headers
+		.iter()
+		.find(|(k, _)| k.eq_ignore_ascii_case(name))
+		.and_then(|(_, v)| v.parse::<i64>().ok())
+		.map(|v| v as i32)
+}
+
+fn header_usize(headers: &HashMap<String, String>, name: &str) -> Option<usize> {
+	headers
+		.iter()
+		.find(|(k, _)| k.eq_ignore_ascii_case(name))
+		.and_then(|(_, v)| v.parse::<usize>().ok())
+}
+
+fn header_str(headers: &HashMap<String, String>, name: &str) -> Option<String> {
+	headers
+		.iter()
+		.find(|(k, _)| k.eq_ignore_ascii_case(name))
+		.map(|(_, v)| v.clone())
 }
 
 impl NotificationHandler for Comix {
