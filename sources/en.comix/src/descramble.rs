@@ -48,8 +48,10 @@ pub fn decode_xor(bytes: &[u8], seed: i32, length: usize, algo: Option<&str>) ->
 pub fn descramble_tiles(image: &ImageRef, seed: i32, algo: Option<&str>) -> ImageRef {
     let width = image.width();
     let height = image.height();
-    let tile_w = width / GRID_COLS as f32;
-    let tile_h = height / GRID_ROWS as f32;
+    // Integer division ensures tile boundaries land on exact pixel boundaries —
+    // fractional tile sizes accumulate rounding error that shows as gap lines.
+    let tile_w = (width as usize / GRID_COLS) as f32;
+    let tile_h = (height as usize / GRID_ROWS) as f32;
 
     let order = if algo == Some("3") {
         build_order_xorshift(seed, NUM_TILES)
