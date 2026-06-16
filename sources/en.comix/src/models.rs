@@ -297,6 +297,20 @@ pub struct ComixPages {
 pub struct ComixPage {
 	pub url: String,
 	pub s: Option<i32>,
+	#[serde(default)]
+	pub width: f32,
+	#[serde(default)]
+	pub height: f32,
+}
+
+#[derive(Deserialize)]
+pub struct TermResponse {
+	pub result: TermItems,
+}
+
+#[derive(Deserialize)]
+pub struct TermItems {
+	pub items: Vec<Term>,
 }
 
 // deserialize a bool from a json bool, number, or string
