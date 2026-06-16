@@ -562,7 +562,14 @@ impl PageImageProcessor for Comix {
 				enc_len.unwrap(),
 				enc_algo.as_deref(),
 			);
-			ImageRef::new(&decoded)
+			let img = ImageRef::new(&decoded);
+			let w = img.width();
+			let h = img.height();
+			if w.is_nan() || h.is_nan() || w <= 0.0 || h <= 0.0 {
+				println!("[comix] process_page_image: XOR decode produced invalid image ({w}x{h}), skipping");
+				return Err(error!("XOR decode produced invalid image dimensions"));
+			}
+			img
 		} else {
 			response.image
 		};
