@@ -15,6 +15,10 @@ pub fn hide_nsfw() -> bool {
 	defaults_get::<bool>(HIDE_NSFW_KEY).unwrap_or(true)
 }
 
+pub fn content_rating() -> &'static str {
+	if hide_nsfw() { "suggestive" } else { "pornographic" }
+}
+
 pub fn image_quality() -> String {
 	defaults_get::<String>(THUMBNAIL_QUALITY_KEY).unwrap_or_default()
 }
