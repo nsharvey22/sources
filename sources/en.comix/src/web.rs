@@ -222,19 +222,50 @@ fn query_to_params_json(query: &str) -> String {
 	format!("{{{}}}", parts.join(","))
 }
 
+fn hex_nibble(b: u8) -> u8 {
+	match b {
+		b'0'..=b'9' => b - b'0',
+		b'a'..=b'f' => b - b'a' + 10,
+		b'A'..=b'F' => b - b'A' + 10,
+		_ => 16,
+	}
+}
+
 fn percent_decode(s: &str) -> String {
-	s.replace("%5B", "[")
-		.replace("%5b", "[")
-		.replace("%5D", "]")
-		.replace("%5d", "]")
-		.replace("%2C", ",")
-		.replace("%2c", ",")
-		.replace("%20", " ")
-		.replace("%2B", "+")
-		.replace("%2b", "+")
-		.replace("%3A", ":")
-		.replace("%3a", ":")
-		.replace('+', " ")
+	let mut result = String::with_capacity(s.len());
+	let bytes = s.as_bytes();
+	let mut i = 0;
+	let mut raw: Vec<u8> = Vec::new();
+
+	while i < bytes.len() {
+		if bytes[i] == b'%' && i + 2 < bytes.len() {
+			let hi = hex_nibble(bytes[i + 1]);
+			let lo = hex_nibble(bytes[i + 2]);
+			if hi < 16 && lo < 16 {
+				raw.push((hi << 4) | lo);
+				i += 3;
+				match core::str::from_utf8(&raw) {
+					Ok(s) => { result.push_str(s); raw.clear(); }
+					Err(e) if e.error_len().is_none() => {} // incomplete multi-byte seq, keep accumulating
+					Err(_) => { for b in raw.drain(..) { result.push(b as char); } }
+				}
+				continue;
+			}
+		}
+		if !raw.is_empty() {
+			match core::str::from_utf8(&raw) {
+				Ok(s) => result.push_str(s),
+				Err(_) => { for b in &raw { result.push(*b as char); } }
+			}
+			raw.clear();
+		}
+		result.push(if bytes[i] == b'+' { ' ' } else { bytes[i] as char });
+		i += 1;
+	}
+	if !raw.is_empty() {
+		if let Ok(s) = core::str::from_utf8(&raw) { result.push_str(s); }
+	}
+	result
 }
 
 fn json_escape(s: &str) -> String {
