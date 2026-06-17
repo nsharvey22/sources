@@ -1,7 +1,7 @@
 #![no_std]
 extern crate alloc;
 
-use aidoku::imports::canvas::ImageRef;
+use aidoku::imports::canvas::{Canvas, ImageRef};
 use aidoku::{
 	Chapter, DeepLinkHandler, DeepLinkResult, FilterValue, HashMap, Home, HomeComponent,
 	HomeLayout, HomePartialResult, ImageRequestProvider, ImageResponse, Link, LinkValue, Listing,
@@ -301,14 +301,25 @@ impl Source for Comix {
 					format!("{base_url}/{}", page.url.trim_start_matches('/'))
 				};
 				Page {
-					content: if let Some(s) = page.s {
+					content: {
 						let mut context = PageContext::new();
-						context.insert("s".into(), s.to_string());
-						context.insert("width".into(), page.width.to_string());
-						context.insert("height".into(), page.height.to_string());
+						// Use the tile-scramble seed if present, otherwise "1" as a
+						// non-zero sentinel. Any non-"0" value causes process_page_image
+						// to re-fetch the URL and inspect response headers, which is the
+						// only way to discover XOR encoding (x-enc-seed/x-enc-algo) for
+						// pages that have no tile scrambling (page.s == None or 0).
+						// Pages without XOR encoding return response.image immediately after
+						// the re-fetch, so the extra round-trip is cheap (usually a cache hit).
+						let s_val = page.s.unwrap_or(0);
+						context.insert("s".into(), if s_val != 0 { s_val.to_string() } else { "1".into() });
+						// Only include dimensions when the API provided non-zero values.
+						// If width or height is 0, omitting them prevents the reader from
+						// computing a NaN cell height via containerWidth * 0 / 0.
+						if page.width > 0.0 && page.height > 0.0 {
+							context.insert("width".into(), page.width.to_string());
+							context.insert("height".into(), page.height.to_string());
+						}
 						PageContent::url_context(url, context)
-					} else {
-						PageContent::url(url)
 					},
 					..Default::default()
 				}
@@ -522,6 +533,7 @@ impl PageImageProcessor for Comix {
 			.and_then(|c| c.get("s"))
 			.is_some_and(|s| s != "0");
 		if !is_scrambled {
+			println!("[comix] process_page_image: not scrambled, returning response.image");
 			return Ok(response.image);
 		}
 
@@ -541,7 +553,35 @@ impl PageImageProcessor for Comix {
 		let scr_grid   = resp.get_header("x-scramble-grid");
 		let scr_algo   = resp.get_header("x-scramble-algo");
 
-		println!("[comix] process_page_image: enc_seed={enc_seed:?} enc_len={enc_len:?} enc_algo={enc_algo:?} scr_seed={scr_seed:?} scr_grid={scr_grid:?} scr_algo={scr_algo:?}");
+		println!("[comix] process_page_image: url={url} enc_seed={enc_seed:?} enc_len={enc_len:?} enc_algo={enc_algo:?} scr_seed={scr_seed:?} scr_grid={scr_grid:?} scr_algo={scr_algo:?}");
+
+		// CDNs sometimes strip custom x-scramble-* headers from cached responses.
+		// Recover by falling back to values embedded in the page context:
+		//   scr_seed  ← context["s"] (page list always provides the scramble seed)
+		//   scr_algo  ← detected from URL ?vN suffix (comix.to uses ?v3 for algo 3)
+		//   scr_grid  ← assume "5x5" when we have seed+algo but no header
+		let scr_seed = scr_seed.or_else(|| {
+			context.as_ref()
+				.and_then(|c| c.get("s"))
+				.and_then(|s| s.parse::<i64>().ok())
+				.filter(|&v| v != 0 && v != 1)
+				.map(|v| v as i32)
+		});
+		let scr_algo = scr_algo.or_else(|| {
+			// Extract ?vN as the first query parameter of the URL.
+			url.split_once('?')
+				.and_then(|(_, q)| {
+					let first = q.split('&').next().unwrap_or(q);
+					match first { "v1" | "v2" | "v3" => Some(first[1..].to_string()), _ => None }
+				})
+		});
+		let scr_grid = if scr_grid.is_none() && scr_seed.is_some() && scr_algo.is_some() {
+			Some("5x5".into())
+		} else {
+			scr_grid
+		};
+
+		println!("[comix] process_page_image: FINAL scr_seed={scr_seed:?} scr_grid={scr_grid:?} scr_algo={scr_algo:?}");
 
 		let needs_xor = enc_seed.is_some_and(|s| s != 0) && enc_len.is_some();
 		let should_descramble = scr_grid.as_deref() == Some("5x5")
@@ -549,25 +589,33 @@ impl PageImageProcessor for Comix {
 			&& matches!(scr_algo.as_deref(), None | Some("1") | Some("2") | Some("3"));
 
 		if !needs_xor && !should_descramble {
+			println!("[comix] process_page_image: no decode needed, returning response.image");
 			return Ok(response.image);
 		}
 
-		// For XOR we need the raw bytes from the re-fetch; for scramble-only we
-		// use the already-decoded image the framework provided.
-		let image = if needs_xor {
+		// Always use freshly re-fetched bytes for any image that needs processing.
+		// Using response.image would cause double-descrambling on the second load:
+		// Aidoku caches our processed output and passes it back as response.image,
+		// so we'd scramble an already-descrambled image into garbage.
+		let image = if needs_xor || should_descramble {
 			let raw = resp.get_data().map_err(|e| error!("{e:?}"))?;
-			let decoded = descramble::decode_xor(
-				&raw,
-				enc_seed.unwrap(),
-				enc_len.unwrap(),
-				enc_algo.as_deref(),
-			);
+			let decoded = if needs_xor {
+				descramble::decode_xor(
+					&raw,
+					enc_seed.unwrap(),
+					enc_len.unwrap(),
+					enc_algo.as_deref(),
+				)
+			} else {
+				raw
+			};
 			let img = ImageRef::new(&decoded);
 			let w = img.width();
 			let h = img.height();
-			if w.is_nan() || h.is_nan() || w <= 0.0 || h <= 0.0 {
-				println!("[comix] process_page_image: XOR decode produced invalid image ({w}x{h}), skipping");
-				return Err(error!("XOR decode produced invalid image dimensions"));
+			println!("[comix] process_page_image: image dims w={w} h={h}");
+			if w.is_nan() || h.is_nan() || w.is_infinite() || h.is_infinite() || w <= 0.0 || h <= 0.0 {
+				println!("[comix] process_page_image: invalid image dims ({w}x{h}), using placeholder");
+				return Ok(Canvas::new(1.0, 1.0).get_image());
 			}
 			img
 		} else {
