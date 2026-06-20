@@ -16,7 +16,11 @@ pub fn hide_nsfw() -> bool {
 }
 
 pub fn content_rating() -> &'static str {
-	if hide_nsfw() { "suggestive" } else { "pornographic" }
+	if hide_nsfw() {
+		"safe,suggestive"
+	} else {
+		"safe,suggestive,erotica,pornographic"
+	}
 }
 
 pub fn image_quality() -> String {
