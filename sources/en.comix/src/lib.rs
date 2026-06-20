@@ -554,8 +554,10 @@ impl PageImageProcessor for Comix {
 		let scr_seed   = resp.get_header("x-scramble-seed").and_then(|v| v.parse::<i64>().ok()).map(|v| v as i32);
 		let scr_grid   = resp.get_header("x-scramble-grid");
 		let scr_algo   = resp.get_header("x-scramble-algo");
+		let scr_hash   = resp.get_header("x-scramble-hash");
+		let scr_hash_val = descramble::decode_scramble_hash(scr_hash.as_deref());
 
-		println!("[comix] process_page_image: url={url} enc_seed={enc_seed:?} enc_len={enc_len:?} enc_algo={enc_algo:?} scr_seed={scr_seed:?} scr_grid={scr_grid:?} scr_algo={scr_algo:?}");
+		println!("[comix] process_page_image: url={url} enc_seed={enc_seed:?} enc_len={enc_len:?} enc_algo={enc_algo:?} scr_seed={scr_seed:?} scr_grid={scr_grid:?} scr_algo={scr_algo:?} scr_hash={scr_hash:?} scr_hash_val={scr_hash_val}");
 
 		// CDNs sometimes strip custom x-scramble-* headers from cached responses.
 		// Recover by falling back to values embedded in the page context:
@@ -625,9 +627,10 @@ impl PageImageProcessor for Comix {
 		};
 
 		if should_descramble {
+			let effective_seed = scr_seed.unwrap() ^ scr_hash_val;
 			Ok(descramble::descramble_tiles(
 				&image,
-				scr_seed.unwrap(),
+				effective_seed,
 				scr_algo.as_deref(),
 			))
 		} else {

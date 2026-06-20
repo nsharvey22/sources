@@ -12,6 +12,14 @@ const ENC_INCREMENT: i32 = 1234567891;
 const LCG_MULTIPLIER: i32 = 1664525;
 const LCG_INCREMENT: i32 = 1013904223;
 
+/// Decode x-scramble-hash header value into an integer to XOR with the scramble seed.
+pub fn decode_scramble_hash(hash: Option<&str>) -> i32 {
+    match hash.map(str::trim) {
+        Some("03632") => 58414,
+        _ => 0,
+    }
+}
+
 /// XOR-decode image bytes according to x-enc-* headers.
 /// `seed`   : x-enc-seed as i32
 /// `length` : x-enc-len as usize
@@ -21,40 +29,21 @@ pub fn decode_xor(bytes: &[u8], seed: i32, length: usize, algo: Option<&str>) ->
         return decode_with_lcg(bytes, seed, length);
     }
 
-    // algo == "2": BuildOrderV2 — xorshift with an interleaved mix variable.
-    // Try 4 byte-shifts × 2 sources (state / mix) = 8 candidates.
-    for &shift in &[0u32, 8, 16, 24] {
-        let c = decode_with_build_order_v2(bytes, seed, length, shift, false);
-        println!("[comix] decode_xor: v2 state shift={shift} bytes[0..4]={:02X?}", &c[..4.min(c.len())]);
-        if has_image_signature(&c) {
-            println!("[comix] decode_xor: v2 state shift={shift} matched signature");
-            return c;
-        }
-    }
-    for &shift in &[0u32, 8, 16, 24] {
-        let c = decode_with_build_order_v2(bytes, seed, length, shift, true);
-        println!("[comix] decode_xor: v2 mix shift={shift} bytes[0..4]={:02X?}", &c[..4.min(c.len())]);
-        if has_image_signature(&c) {
-            println!("[comix] decode_xor: v2 mix shift={shift} matched signature");
-            return c;
-        }
-    }
+    // algo == "2": try candidates in order, return the first with a valid image signature.
+    let candidates = [
+        decode_with_xorshift(bytes, seed | 1, length, false),
+        decode_with_xorshift(bytes, seed, length, false),
+        decode_with_xorshift(bytes, seed | 1, length, true),
+        decode_with_lcg(bytes, seed, length),
+    ];
 
-    // Fallback to the old xorshift / LCG candidates.
-    let c0 = decode_with_xorshift(bytes, seed | 1, length, false);
-    if has_image_signature(&c0) { println!("[comix] decode_xor: xorshift seed|1 low matched"); return c0; }
-    let c1 = decode_with_xorshift(bytes, seed, length, false);
-    if has_image_signature(&c1) { println!("[comix] decode_xor: xorshift seed low matched"); return c1; }
-    let c2 = decode_with_xorshift(bytes, seed | 1, length, true);
-    if has_image_signature(&c2) { println!("[comix] decode_xor: xorshift seed|1 high matched"); return c2; }
-    let c3 = decode_with_lcg(bytes, seed, length);
-    if has_image_signature(&c3) { println!("[comix] decode_xor: lcg matched"); return c3; }
-
-    // All candidates failed — return the original encrypted bytes so that
-    // ImageRef::new() produces 0×0 dimensions and the caller's guard shows
-    // a placeholder instead of crashing the layout with NaN height.
-    println!("[comix] decode_xor: all candidates failed for seed={seed} algo={algo:?}, returning original bytes");
-    bytes.to_vec()
+    candidates
+        .into_iter()
+        .find(|c| has_image_signature(c))
+        .unwrap_or_else(|| {
+            println!("[comix] decode_xor: all candidates failed for seed={seed}, returning original bytes");
+            bytes.to_vec()
+        })
 }
 
 /// Rearrange 5×5 tiles to undo the grid scrambling applied by comix.to.
@@ -91,33 +80,6 @@ pub fn descramble_tiles(image: &ImageRef, seed: i32, algo: Option<&str>) -> Imag
 }
 
 // ── XOR decoders ─────────────────────────────────────────────────────────────
-
-/// BuildOrderV2: xorshift32 with an interleaved mix variable (rotate-left-9).
-/// This is the algorithm the site uses for x-enc-algo == "2".
-/// `shift`   : which byte of state/mix to use as the XOR key (0, 8, 16, or 24)
-/// `use_mix` : if true, XOR key comes from `mix`; if false, from `state`
-fn decode_with_build_order_v2(
-    bytes: &[u8],
-    seed: i32,
-    length: usize,
-    shift: u32,
-    use_mix: bool,
-) -> Vec<u8> {
-    let mut result = bytes.to_vec();
-    let mut state = (seed as u32) | 1; // ensure non-zero
-    let mut mix: u32 = 0;
-    let limit = result.len().min(length);
-    for byte in result.iter_mut().take(limit) {
-        state ^= state << 13;
-        mix = mix.wrapping_add(state);
-        state ^= state >> 17;
-        mix = mix.rotate_left(9) ^ state;
-        state ^= state << 5;
-        let key = if use_mix { (mix >> shift) as u8 } else { (state >> shift) as u8 };
-        *byte ^= key;
-    }
-    result
-}
 
 fn decode_with_xorshift(
     bytes: &[u8],
@@ -181,21 +143,17 @@ fn has_image_signature(bytes: &[u8]) -> bool {
 
 // ── Tile order builders ───────────────────────────────────────────────────────
 
-/// Build a tile order for x-scramble-algo == "3".
-/// Uses BuildOrderV2 PRNG (xorshift32 + mix), then inverts — matching Swift buildShuffleOrderV3.
+/// Build a tile order for x-scramble-algo == "3" using plain xorshift32.
 /// Returns the INVERSE permutation so that order[dst] = src.
 fn build_order_xorshift(seed: i32, n: usize) -> Vec<usize> {
     let mut arr: Vec<usize> = (0..n).collect();
     let mut state: u32 = (seed as u32) | 1;
-    let mut mix: u32 = 0;
 
     for i in (1..n).rev() {
         state ^= state << 13;
-        mix = mix.wrapping_add(state.wrapping_mul(i as u32 + 1));
         state ^= state >> 17;
-        mix = mix.rotate_left(9) ^ state;
         state ^= state << 5;
-        let j = (state % (i as u32 + 1)) as usize;
+        let j = ((state as u64) % (i as u64 + 1)) as usize;
         arr.swap(i, j);
     }
 
