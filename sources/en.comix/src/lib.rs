@@ -152,7 +152,9 @@ impl Source for Comix {
 
 		qs.push("page", Some(&page.to_string()));
 		qs.push("limit", Some("28"));
-		qs.push("content_rating", Some(settings::content_rating()));
+		for rating in settings::content_ratings() {
+			qs.push("content_rating[]", Some(rating));
+		}
 
 		if query.is_some() {
 			qs.push("keyword", query.as_deref());
@@ -355,7 +357,7 @@ impl Home for Comix {
 			],
 		}));
 
-		let content_rating = settings::content_rating();
+		let cr = settings::content_rating_qs();
 		let hidden_types = settings::hidden_types();
 		let hidden_terms = settings::hidden_terms();
 
@@ -368,10 +370,10 @@ impl Home for Comix {
 		};
 
 		let home_sections = [
-			("Most Recent Popular",    format!("{API_URL}/manga/top?type=trending&days=1&limit=50&content_rating={content_rating}"), false),
-			("Most Follows New Comics",format!("{API_URL}/manga/top?type=follows&days=1&limit=50&content_rating={content_rating}"),  false),
-			("Latest Updates (Hot)",   format!("{API_URL}/manga?order[chapter_updated_at]=desc&scope=hot&content_rating={content_rating}&page=1&limit=31"), false),
-			("Recently Added",         format!("{API_URL}/manga?order[created_at]=desc&content_rating={content_rating}&page=1&limit=31"), true),
+			("Most Recent Popular",    format!("{API_URL}/manga/top?type=trending&days=1&limit=50&{cr}"), false),
+			("Most Follows New Comics",format!("{API_URL}/manga/top?type=follows&days=1&limit=50&{cr}"),  false),
+			("Latest Updates (Hot)",   format!("{API_URL}/manga?order[chapter_updated_at]=desc&scope=hot&{cr}&page=1&limit=31"), false),
+			("Recently Added",         format!("{API_URL}/manga?order[created_at]=desc&{cr}&page=1&limit=31"), true),
 		];
 
 		for (title, url, is_chapter_list) in &home_sections {
@@ -491,24 +493,24 @@ impl ListingProvider for Comix {
 				.map_err(|e| { println!("[comix] listing parse error: {e}"); error!("{e}") })
 		}
 
-		let cr = settings::content_rating();
+		let cr = settings::content_rating_qs();
 
 		match listing.id.as_str() {
 			"Trending Webtoon" => trending(vec!["manhua".into(), "manhwa".into()]),
 			"Trending Manga" => trending(vec!["manga".into()]),
 
 			"Most Recent Popular" => get_listing_page(&format!(
-				"{API_URL}/manga/top?type=trending&days=1&limit=50&content_rating={cr}"
+				"{API_URL}/manga/top?type=trending&days=1&limit=50&{cr}"
 			)),
 			"Most Follows New Comics" => get_listing_page(&format!(
-				"{API_URL}/manga/top?type=follows&days=1&limit=50&content_rating={cr}"
+				"{API_URL}/manga/top?type=follows&days=1&limit=50&{cr}"
 			)),
 
 			"Latest Updates (Hot)" => get_listing_page(&format!(
-				"{API_URL}/manga?order[chapter_updated_at]=desc&scope=hot&content_rating={cr}&page={page}&limit=31"
+				"{API_URL}/manga?order[chapter_updated_at]=desc&scope=hot&{cr}&page={page}&limit=31"
 			)),
 			"Recently Added" => get_listing_page(&format!(
-				"{API_URL}/manga?order[created_at]=desc&content_rating={cr}&page={page}&limit=31"
+				"{API_URL}/manga?order[created_at]=desc&{cr}&page={page}&limit=31"
 			)),
 
 			_ => bail!("Unknown listing"),

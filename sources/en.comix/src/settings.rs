@@ -15,8 +15,24 @@ pub fn hide_nsfw() -> bool {
 	defaults_get::<bool>(HIDE_NSFW_KEY).unwrap_or(true)
 }
 
-pub fn content_rating() -> &'static str {
-	if hide_nsfw() { "suggestive" } else { "pornographic" }
+pub fn content_ratings() -> &'static [&'static str] {
+	if hide_nsfw() {
+		&["safe", "suggestive"]
+	} else {
+		&["safe", "suggestive", "erotica", "pornographic"]
+	}
+}
+
+pub fn content_rating_qs() -> String {
+	content_ratings()
+		.iter()
+		.map(|r| {
+			let mut s = String::from("content_rating[]=");
+			s.push_str(r);
+			s
+		})
+		.collect::<Vec<_>>()
+		.join("&")
 }
 
 pub fn image_quality() -> String {
