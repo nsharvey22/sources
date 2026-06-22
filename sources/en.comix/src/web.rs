@@ -60,11 +60,25 @@ fn find_secure_module_src(web_view: &mut ComixWebView) -> Result<()> {
 		.captures(main_module_contents.as_str())
 		.and_then(|c| c.get(1).map(|m| m.as_str()))
 		.ok_or(error!("Secure module not found"))?;
+
+	// Fetch the secure module over the network stack (which carries a valid cf_clearance)
+	// rather than letting the WebView fetch it via import() of the remote URL. On some
+	// devices Cloudflare challenges the WebView's own asset fetch, so the remote import
+	// silently fails and the signer functions never load. We import the fetched source via
+	// a blob URL instead, which executes it as a module without another network request.
+	let secure_url = format!("{BASE_URL}{js_asset_path}{secure_script_path}");
+	let secure_src = Request::get(&secure_url)?.string()?;
+	let secure_src_literal = serde_json::to_string(&secure_src)
+		.map_err(|e| error!("Failed to encode secure module: {e}"))?;
 	web_view.web_view.eval(&format!(
 		"(() => {{\
-			import('{BASE_URL}{js_asset_path}{secure_script_path}')\
-				.then((m) => window['vm'] = m)\
-				.catch((e) => window['vm'] = {{}});\
+			try {{\
+				const blob = new Blob([{secure_src_literal}], {{ type: 'text/javascript' }});\
+				const blobUrl = URL.createObjectURL(blob);\
+				import(blobUrl)\
+					.then((m) => {{ window['vm'] = m; URL.revokeObjectURL(blobUrl); }})\
+					.catch((e) => {{ window['vm'] = {{}}; URL.revokeObjectURL(blobUrl); }});\
+			}} catch (e) {{ window['vm'] = {{}}; }}\
 			return '';\
 		}})()"
 	))?;
