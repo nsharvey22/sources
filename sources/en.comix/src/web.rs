@@ -318,7 +318,6 @@ pub fn fetch_api(web_view: &ComixWebView, url: &str) -> Result<String> {
 	Request::get(&full_url)?.string()
 }
 
-#[allow(dead_code)]
 pub fn descramble_image(
 	web_view: &ComixWebView,
 	width: f32,
@@ -340,18 +339,26 @@ pub fn descramble_image(
 		const signal = controller.signal;\
 		{GET_VMOBJ_JS}\
 		{descrambler_fn}('{url}', signal)\
-			.then((data) => {{\
-				const url = URL.createObjectURL(data);\
-				const image = new Image();\
-				image.src = url;\
-				image.onload = () => {{\
-					URL.revokeObjectURL(url);\
-					const ctx = canvas.getContext('2d');\
-					ctx.drawImage(image, 0, 0);\
+			.then((result) => {{\
+				if (result && typeof result === 'object' && typeof result.apply === 'function') {{\
+					/* current API: descrambler resolves to an object that paints the \
+					   descrambled image onto a canvas element via apply(canvas) */\
+					result.apply(canvas);\
 					window['TEMP_STATE'].isDone = true;\
+				}} else {{\
+					/* legacy API: resolves to a Blob/image source */\
+					const objUrl = URL.createObjectURL(result);\
+					const image = new Image();\
+					image.onload = () => {{\
+						URL.revokeObjectURL(objUrl);\
+						canvas.getContext('2d').drawImage(image, 0, 0);\
+						window['TEMP_STATE'].isDone = true;\
+					}};\
+					image.onerror = () => {{ window['TEMP_STATE'].isDone = true; window['TEMP_STATE'].error = 'image load failed'; }};\
+					image.src = objUrl;\
 				}}\
 			}})\
-			.catch((e) => {{ window['TEMP_STATE'].isDone = true; window['TEMP_STATE'].error = e }});\
+			.catch((e) => {{ window['TEMP_STATE'].isDone = true; window['TEMP_STATE'].error = '' + e }});\
 		return '';\
 	}})()"
 	))?;

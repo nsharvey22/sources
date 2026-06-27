@@ -12,11 +12,21 @@ const ENC_INCREMENT: i32 = 1234567891;
 const LCG_MULTIPLIER: i32 = 1664525;
 const LCG_INCREMENT: i32 = 1013904223;
 
-/// Decode x-scramble-hash header value into an integer to XOR with the scramble seed.
-pub fn decode_scramble_hash(hash: Option<&str>) -> i32 {
+/// The seed-correction constant for a known x-scramble-hash version.
+///
+/// The `x-scramble-seed` header is the true descramble seed XORed with a per-version
+/// constant that the site computes inside an obfuscated bytecode VM (secure-*.js). We
+/// can only de-obfuscate the seed natively for hash versions whose constant we know.
+///
+/// Returns `Some(k)` for a known version (XOR the header seed with `k` to recover the
+/// true seed; `Some(0)` means the header seed is already correct), or `None` for an
+/// unknown version — in which case the caller must fall back to the site's own JS
+/// descrambler, since the constant cannot be derived from the VM.
+pub fn scramble_hash_correction(hash: Option<&str>) -> Option<i32> {
     match hash.map(str::trim) {
-        Some("03632") => 58414,
-        _ => 0,
+        Some("03632") => Some(58414),
+        Some("e0a02") => Some(0),
+        _ => None,
     }
 }
 

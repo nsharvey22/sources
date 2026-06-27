@@ -1,6 +1,8 @@
 #![no_std]
 extern crate alloc;
 
+use core::cell::RefCell;
+
 use aidoku::imports::canvas::{Canvas, ImageRef};
 use aidoku::{
 	Chapter, DeepLinkHandler, DeepLinkResult, FilterValue, HashMap, Home, HomeComponent,
@@ -29,11 +31,18 @@ const API_URL: &str = "https://comix.to/api/v1";
 
 const CONTENT_TYPES: &[&str] = &["manga", "manhwa", "manhua", "other"];
 
-struct Comix;
+struct Comix {
+	// Lazily-created WebView reused to run the site's own JS descrambler for image
+	// versions we can't descramble natively (see process_page_image). Cached because
+	// loading the page + secure module is expensive.
+	descramble_web_view: RefCell<Option<web::ComixWebView>>,
+}
 
 impl Source for Comix {
 	fn new() -> Self {
-		Self
+		Self {
+			descramble_web_view: RefCell::new(None),
+		}
 	}
 
 	fn get_search_manga_list(
@@ -524,6 +533,48 @@ impl ImageRequestProvider for Comix {
 	}
 }
 
+impl Comix {
+	/// Descramble an image using the site's own JS descrambler (the `ns`/`__comixDesc`
+	/// function from secure-*.js), run in a cached WebView. This is the fallback for
+	/// scrambled images whose x-scramble-hash version we have no native seed correction
+	/// for — the JS handles XOR + tile descramble for any version. Returns the final image.
+	fn descramble_via_web_view(&self, url: &str, width: f32, height: f32) -> Result<ImageRef> {
+		// lazily create + cache the web view (loading the page + secure module is expensive)
+		if self.descramble_web_view.borrow().is_none() {
+			let wv = web::create_web_view()?;
+			*self.descramble_web_view.borrow_mut() = Some(wv);
+		}
+
+		// try the cached web view; if it errors (stale clearance / module), rebuild once
+		let data_url = {
+			let slot = self.descramble_web_view.borrow();
+			web::descramble_image(slot.as_ref().unwrap(), width, height, url)
+		};
+		let data_url = match data_url {
+			Ok(d) => d,
+			Err(e) => {
+				println!("[comix] descramble_via_web_view: retrying with fresh web view ({e:?})");
+				let wv = web::create_web_view()?;
+				*self.descramble_web_view.borrow_mut() = Some(wv);
+				let slot = self.descramble_web_view.borrow();
+				web::descramble_image(slot.as_ref().unwrap(), width, height, url)?
+			}
+		};
+
+		let bytes = decode_data_url(&data_url)?;
+		Ok(ImageRef::new(&bytes))
+	}
+}
+
+/// Decode a `data:` URL (e.g. `data:image/png;base64,...`) into raw image bytes.
+fn decode_data_url(data_url: &str) -> Result<Vec<u8>> {
+	use base64::Engine;
+	let comma = data_url.find(',').ok_or(error!("Invalid data URL"))?;
+	base64::engine::general_purpose::STANDARD
+		.decode(data_url[comma + 1..].as_bytes())
+		.map_err(|e| error!("base64 decode failed: {e}"))
+}
+
 impl PageImageProcessor for Comix {
 	fn process_page_image(
 		&self,
@@ -555,21 +606,33 @@ impl PageImageProcessor for Comix {
 		let scr_grid   = resp.get_header("x-scramble-grid");
 		let scr_algo   = resp.get_header("x-scramble-algo");
 		let scr_hash   = resp.get_header("x-scramble-hash");
-		let scr_hash_val = descramble::decode_scramble_hash(scr_hash.as_deref());
+		let correction = descramble::scramble_hash_correction(scr_hash.as_deref());
 
-		println!("[comix] process_page_image: url={url} enc_seed={enc_seed:?} enc_len={enc_len:?} enc_algo={enc_algo:?} scr_seed={scr_seed:?} scr_grid={scr_grid:?} scr_algo={scr_algo:?} scr_hash={scr_hash:?} scr_hash_val={scr_hash_val}");
+		println!("[comix] process_page_image: url={url} enc_seed={enc_seed:?} enc_len={enc_len:?} enc_algo={enc_algo:?} scr_seed={scr_seed:?} scr_grid={scr_grid:?} scr_algo={scr_algo:?} scr_hash={scr_hash:?} correction={correction:?}");
 
-		// CDNs sometimes strip custom x-scramble-* headers from cached responses.
-		// Recover by falling back to values embedded in the page context:
-		//   scr_seed  ← context["s"] (page list always provides the scramble seed)
-		//   scr_algo  ← detected from URL ?vN suffix (comix.to uses ?v3 for algo 3)
-		//   scr_grid  ← assume "5x5" when we have seed+algo but no header
-		let scr_seed = scr_seed.or_else(|| {
-			context.as_ref()
-				.and_then(|c| c.get("s"))
-				.and_then(|s| s.parse::<i64>().ok())
-				.filter(|&v| v != 0 && v != 1)
-				.map(|v| v as i32)
+		// Resolve the true scramble seed for the native descrambler.
+		//
+		// The API page list embeds the unobfuscated seed in context["s"] (page.s). The
+		// x-scramble-seed header carries that same seed XORed with a per-version constant
+		// keyed by x-scramble-hash (see descramble::scramble_hash_correction) — i.e.
+		// header_seed ^ K == page.s. We PREFER the page-list seed (no constant needed), and
+		// otherwise use the header seed corrected by K. When we have neither — no page.s and
+		// an unknown hash version (no K) — the native descrambler can't run, and we fall back
+		// to the site's own JS descrambler further down.
+		//
+		// CDNs also sometimes strip the custom x-scramble-* headers from cached responses;
+		// scr_algo/scr_grid below recover from the URL suffix / a 5x5 assumption.
+		let context_seed = context.as_ref()
+			.and_then(|c| c.get("s"))
+			.and_then(|s| s.parse::<i64>().ok())
+			.filter(|&v| v != 0 && v != 1)
+			.map(|v| v as i32);
+		let header_seed = scr_seed; // raw x-scramble-seed (obfuscated)
+		let native_seed = context_seed.or_else(|| {
+			match (header_seed, correction) {
+				(Some(h), Some(k)) => Some(h ^ k),
+				_ => None,
+			}
 		});
 		let scr_algo = scr_algo.or_else(|| {
 			// Extract ?vN as the first query parameter of the URL.
@@ -579,22 +642,46 @@ impl PageImageProcessor for Comix {
 					match first { "v1" | "v2" | "v3" => Some(first[1..].to_string()), _ => None }
 				})
 		});
-		let scr_grid = if scr_grid.is_none() && scr_seed.is_some() && scr_algo.is_some() {
+		let has_seed = header_seed.is_some_and(|s| s != 0) || context_seed.is_some();
+		let scr_grid = if scr_grid.is_none() && has_seed && scr_algo.is_some() {
 			Some("5x5".into())
 		} else {
 			scr_grid
 		};
 
-		println!("[comix] process_page_image: FINAL scr_seed={scr_seed:?} scr_grid={scr_grid:?} scr_algo={scr_algo:?}");
-
 		let needs_xor = enc_seed.is_some_and(|s| s != 0) && enc_len.is_some();
 		let should_descramble = scr_grid.as_deref() == Some("5x5")
-			&& scr_seed.is_some_and(|s| s != 0)
+			&& has_seed
 			&& matches!(scr_algo.as_deref(), None | Some("1") | Some("2") | Some("3"));
+
+		println!("[comix] process_page_image: FINAL native_seed={native_seed:?} (context_seed={context_seed:?}, header_seed={header_seed:?}) scr_grid={scr_grid:?} scr_algo={scr_algo:?} should_descramble={should_descramble} needs_xor={needs_xor}");
 
 		if !needs_xor && !should_descramble {
 			println!("[comix] process_page_image: no decode needed, returning response.image");
 			return Ok(response.image);
+		}
+
+		// If the image is scrambled but we can't recover the true seed natively (unknown
+		// x-scramble-hash version with no page.s), fall back to the site's own JS
+		// descrambler, which handles the XOR + tile descramble internally for any version.
+		if should_descramble && native_seed.is_none() {
+			println!("[comix] process_page_image: unknown hash {scr_hash:?}, using JS descrambler fallback");
+			// canvas dimensions for the JS descrambler: prefer the page-list dims, else read
+			// them from the (scrambled but structurally valid) re-fetched image.
+			let ctx_w = context.as_ref().and_then(|c| c.get("width")).and_then(|s| s.parse::<f32>().ok());
+			let ctx_h = context.as_ref().and_then(|c| c.get("height")).and_then(|s| s.parse::<f32>().ok());
+			let (w, h) = if let (Some(w), Some(h)) = (ctx_w, ctx_h) {
+				(w, h)
+			} else {
+				let raw = resp.get_data().map_err(|e| error!("{e:?}"))?;
+				let img = ImageRef::new(&raw);
+				(img.width(), img.height())
+			};
+			if w <= 0.0 || h <= 0.0 || w.is_nan() || h.is_nan() || w.is_infinite() || h.is_infinite() {
+				println!("[comix] process_page_image: invalid fallback dims ({w}x{h}), using placeholder");
+				return Ok(Canvas::new(1.0, 1.0).get_image());
+			}
+			return self.descramble_via_web_view(&url, w, h);
 		}
 
 		// Always use freshly re-fetched bytes for any image that needs processing.
@@ -627,10 +714,11 @@ impl PageImageProcessor for Comix {
 		};
 
 		if should_descramble {
-			let effective_seed = scr_seed.unwrap() ^ scr_hash_val;
+			// native_seed is the true (unobfuscated) seed: either the page-list seed
+			// or the hash-corrected header seed (see seed resolution above).
 			Ok(descramble::descramble_tiles(
 				&image,
-				effective_seed,
+				native_seed.unwrap(),
 				scr_algo.as_deref(),
 			))
 		} else {
