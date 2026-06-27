@@ -25,6 +25,7 @@ const LCG_INCREMENT: i32 = 1013904223;
 pub fn scramble_hash_correction(hash: Option<&str>) -> Option<i32> {
     match hash.map(str::trim) {
         Some("03632") => Some(58414),
+        Some("02900") => Some(117532),
         Some("e0a02") => Some(0),
         _ => None,
     }
