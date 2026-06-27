@@ -541,28 +541,35 @@ impl Comix {
 	fn descramble_via_web_view(&self, url: &str, width: f32, height: f32) -> Result<ImageRef> {
 		// lazily create + cache the web view (loading the page + secure module is expensive)
 		if self.descramble_web_view.borrow().is_none() {
-			let wv = web::create_web_view()?;
-			*self.descramble_web_view.borrow_mut() = Some(wv);
+			*self.descramble_web_view.borrow_mut() = Some(web::create_web_view()?);
 		}
 
-		// try the cached web view; if it errors (stale clearance / module), rebuild once
-		let data_url = {
-			let slot = self.descramble_web_view.borrow();
-			web::descramble_image(slot.as_ref().unwrap(), width, height, url)
-		};
-		let data_url = match data_url {
-			Ok(d) => d,
-			Err(e) => {
-				println!("[comix] descramble_via_web_view: retrying with fresh web view ({e:?})");
-				let wv = web::create_web_view()?;
-				*self.descramble_web_view.borrow_mut() = Some(wv);
-				let slot = self.descramble_web_view.borrow();
-				web::descramble_image(slot.as_ref().unwrap(), width, height, url)?
+		// The descrambler fetches the image itself inside the web view, so it can hit a
+		// transient network/Cloudflare hiccup. Retry a few times on the cached view (cheap),
+		// then rebuild the view once as a last resort (handles stale clearance / module).
+		const ATTEMPTS: usize = 4;
+		const REBUILD_ON: usize = 3; // final attempt rebuilds the web view first
+		let mut last_err = None;
+		for attempt in 0..ATTEMPTS {
+			if attempt == REBUILD_ON {
+				match web::create_web_view() {
+					Ok(wv) => *self.descramble_web_view.borrow_mut() = Some(wv),
+					Err(e) => { last_err = Some(e); continue; }
+				}
 			}
-		};
-
-		let bytes = decode_data_url(&data_url)?;
-		Ok(ImageRef::new(&bytes))
+			let result = {
+				let slot = self.descramble_web_view.borrow();
+				web::descramble_image(slot.as_ref().unwrap(), width, height, url)
+			};
+			match result {
+				Ok(data_url) => return Ok(ImageRef::new(&decode_data_url(&data_url)?)),
+				Err(e) => {
+					println!("[comix] descramble_via_web_view: attempt {attempt} failed ({e:?})");
+					last_err = Some(e);
+				}
+			}
+		}
+		Err(last_err.unwrap_or_else(|| error!("Failed to descramble image")))
 	}
 }
 

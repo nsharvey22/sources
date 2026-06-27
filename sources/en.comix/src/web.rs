@@ -371,17 +371,20 @@ pub fn descramble_image(
 
 	let result = web_view.web_view.eval(
 		"(() => {\
-		if (window['TEMP_STATE'].error) return '';\
+		if (window['TEMP_STATE'].error) return 'ERR:' + window['TEMP_STATE'].error;\
 		const data = window['originalGetImageData'].call(window['TEMP_CANVAS']);\
+		if (!data) return 'ERR: empty canvas data';\
 		return data;\
 	})()",
 	)?;
 
-	if result.is_empty() {
-		bail!("Failed to descramble image")
-	} else {
-		Ok(result)
+	if let Some(err) = result.strip_prefix("ERR:") {
+		bail!("descramble failed:{err}")
 	}
+	if result.is_empty() {
+		bail!("Failed to descramble image (empty result)")
+	}
+	Ok(result)
 }
 
 pub fn decode_response(web_view: &ComixWebView, url: &str, encoded_res: &str) -> Result<String> {
