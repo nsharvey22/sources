@@ -1,5 +1,5 @@
 // reference: https://github.com/nobottomline/extensions-source/blob/c8fe930f315f3baee23587559edfceab5e969202/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Signer.kt
-use crate::BASE_URL;
+use crate::{BASE_URL, MIRROR_URL};
 use aidoku::{
 	HashMap, Result,
 	alloc::string::String,
@@ -33,6 +33,7 @@ const DESCRAMBLER_CANVAS_TOKEN: &str = "__AIDOKU_DESCRAMBLER_CANVAS_TOKEN__";
 const DESCRAMBLER_RESPONSE_TOKEN: &str = "__AIDOKU_DESCRAMBLER_RESPONSE_TOKEN__";
 const EMPTY_DESCRAMBLER_RESPONSE_OBJECT: &str =
 	"{ data: null, error: null, isDone: false, isAbort: false }";
+
 const FETCH_TIMEOUT_RESPONSE: &str =
 	"Fetch timeout after 30s. If problem persist, please restart the application.";
 
@@ -56,6 +57,9 @@ struct DescrambleResponseObject {
 pub struct ComixWebView {
 	web_view: WebView,
 	is_initialized: bool,
+	/// The site base currently in use: BASE_URL normally, or MIRROR_URL when the
+	/// primary site couldn't be loaded (unreachable/blocked for this user).
+	active_base: &'static str,
 }
 
 impl ComixWebView {
@@ -63,27 +67,40 @@ impl ComixWebView {
 		Self {
 			web_view: WebView::new(),
 			is_initialized: false,
+			active_base: BASE_URL,
 		}
 	}
 
 	fn load_webview(&mut self) -> Result<()> {
-		self.web_view.load_html_blocking(
-			Request::get(BASE_URL)?
-				.string()?
-				.replace("<head>", JS_PATCHER)
-				.as_str(),
-			Some(BASE_URL),
-		)?;
-		if self.find_functions().is_err() {
-			self.find_secure_module_src()?;
-			self.find_functions()?;
+		// try the primary site first; if it can't be loaded (or the signer functions can't
+		// be found in what it returns, e.g. a block page), retry against the mirror
+		if self.try_load_webview(BASE_URL).is_ok() {
+			self.active_base = BASE_URL;
+		} else {
+			self.try_load_webview(MIRROR_URL)?;
+			self.active_base = MIRROR_URL;
 		}
 		self.is_initialized = true;
 		Ok(())
 	}
 
-	fn find_secure_module_src(&mut self) -> Result<()> {
-		let main_module_src = Request::get(BASE_URL)?
+	fn try_load_webview(&mut self, base: &'static str) -> Result<()> {
+		self.web_view.load_html_blocking(
+			Request::get(base)?
+				.string()?
+				.replace("<head>", JS_PATCHER)
+				.as_str(),
+			Some(base),
+		)?;
+		if self.find_functions().is_err() {
+			self.find_secure_module_src(base)?;
+			self.find_functions()?;
+		}
+		Ok(())
+	}
+
+	fn find_secure_module_src(&mut self, base: &str) -> Result<()> {
+		let main_module_src = Request::get(base)?
 			.html()?
 			.select("head > script[type=\"module\"][src*=\"main\"]")
 			.and_then(|e| e.first())
@@ -93,14 +110,14 @@ impl ComixWebView {
 			let js_asset_path = &main_module_src[0..js_asset_path_index + 1];
 			let secure_script_regex = Regex::new("(secure-[A-Za-z0-9-_]+?\\.js)").unwrap();
 			let main_module_contents =
-				Request::get(format!("{BASE_URL}{main_module_src}"))?.string()?;
+				Request::get(format!("{base}{main_module_src}"))?.string()?;
 			if let Some(secure_script_path) = secure_script_regex
 				.captures(main_module_contents.as_str())
 				.and_then(|captures| captures.get(1).map(|m| m.as_str()))
 			{
 				self.web_view.eval(&format!(
 					"(() => {{
-						import('{BASE_URL}{js_asset_path}{secure_script_path}')
+						import('{base}{js_asset_path}{secure_script_path}')
 						.then((m) => window['vm'] = m)
 						.catch((e) => window['vm'] = {{}});
 						return '';
@@ -204,6 +221,16 @@ impl ComixWebView {
 		if !self.is_initialized {
 			self.load_webview()?
 		}
+
+		// when the mirror is active, sign and send api requests against it — callers
+		// always build urls with the primary BASE_URL/API_URL constants
+		let mirrored_url: String;
+		let url = if self.active_base != BASE_URL && url.starts_with(BASE_URL) {
+			mirrored_url = url.replacen(BASE_URL, self.active_base, 1);
+			mirrored_url.as_str()
+		} else {
+			url
+		};
 
 		let result = self.web_view.eval(&format!(
 			"(() => {{

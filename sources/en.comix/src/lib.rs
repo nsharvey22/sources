@@ -25,6 +25,8 @@ use models::*;
 use web::*;
 
 const BASE_URL: &str = "https://comix.to";
+/// Official mirror, used as a fallback when the primary site is unreachable or blocked.
+const MIRROR_URL: &str = "https://comix.ws";
 const API_URL: &str = "https://comix.to/api/v1";
 
 const CONTENT_TYPES: &[&str] = &["manga", "manhwa", "manhua", "other"];
@@ -524,38 +526,83 @@ impl PageImageProcessor for Comix {
 		response: ImageResponse,
 		context: Option<PageContext>,
 	) -> Result<ImageRef> {
-		if let Some(context) = context {
-			if context.get("s").is_some_and(|s| s == "1") {
-				let Some(url) = response.request.url else {
-					bail!("Unable to get the image url")
-				};
+		let is_scrambled = context
+			.as_ref()
+			.is_some_and(|c| c.get("s").is_some_and(|s| s == "1"));
 
-				let Some(width) = context.get("width").and_then(|s| s.parse::<f32>().ok()) else {
-					bail!("Unable to get the image width")
-				};
+		// Scrambled pages: the JS descrambler fetches the image itself and depends on the exact
+		// recorded URL (its scramble seed/hash are path-specific), so we must NOT rewrite it.
+		// This matches the previous behavior — the descrambler handles the fetch as before.
+		if is_scrambled {
+			let Some(context) = context else {
+				bail!("Unable to get the page context")
+			};
 
-				let Some(height) = context.get("height").and_then(|s| s.parse::<f32>().ok()) else {
-					bail!("Unable to get the image height")
-				};
+			let Some(url) = response.request.url else {
+				bail!("Unable to get the image url")
+			};
 
-				let mut web_view = self.web_view.borrow_mut();
+			let Some(width) = context.get("width").and_then(|s| s.parse::<f32>().ok()) else {
+				bail!("Unable to get the image width")
+			};
 
-				let data_url = web_view.descramble_image(width, height, url.as_ref())?;
-				let Some((_, base64_data)) = data_url.split_once(',') else {
-					bail!("Unable to get the raw image data")
-				};
-				let bytes: Vec<u8> = general_purpose::STANDARD
-					.decode(base64_data)
-					.or_else(|_| bail!("Invalid base64 data given"))?;
+			let Some(height) = context.get("height").and_then(|s| s.parse::<f32>().ok()) else {
+				bail!("Unable to get the image height")
+			};
 
-				Ok(ImageRef::new(bytes.as_ref()))
-			} else {
-				Ok(response.image)
+			let mut web_view = self.web_view.borrow_mut();
+
+			let data_url = web_view.descramble_image(width, height, url.as_ref())?;
+			let Some((_, base64_data)) = data_url.split_once(',') else {
+				bail!("Unable to get the raw image data")
+			};
+			let bytes: Vec<u8> = general_purpose::STANDARD
+				.decode(base64_data)
+				.or_else(|_| bail!("Invalid base64 data given"))?;
+
+			Ok(ImageRef::new(bytes.as_ref()))
+		} else if response.code == 404 {
+			// non-scrambled page whose recorded path variant 404'd: like the site's own client,
+			// retry the alternate path segments and use the first that resolves. safe here
+			// because we return the fetched bytes directly (no path-specific descrambling).
+			if let Some(original) = response.request.url.as_ref() {
+				for candidate in image_path_fallbacks(original) {
+					let Ok(resp) = Request::get(&candidate)
+						.map(|r| r.header("Referer", &format!("{BASE_URL}/")))
+						.and_then(|r| r.send())
+					else {
+						continue;
+					};
+					if resp.status_code() != 404 {
+						if let Ok(image) = resp.get_image() {
+							return Ok(image);
+						}
+						break;
+					}
+				}
 			}
+			Ok(response.image)
 		} else {
 			Ok(response.image)
 		}
 	}
+}
+
+/// Alternate CDN path segments for page images; the site's own client retries these when
+/// the recorded variant returns a 404.
+const IMAGE_PATH_SEGMENTS: &[&str] = &["/i5/", "/si/", "/i/", "/sii/", "/ii/"];
+
+/// Returns fallback URLs for an image URL whose path variant 404'd, swapping the
+/// `/i5/`-style segment for each alternative.
+fn image_path_fallbacks(url: &str) -> Vec<String> {
+	let Some(current) = IMAGE_PATH_SEGMENTS.iter().find(|s| url.contains(**s)) else {
+		return Vec::new();
+	};
+	IMAGE_PATH_SEGMENTS
+		.iter()
+		.filter(|s| *s != current)
+		.map(|s| url.replacen(*current, s, 1))
+		.collect()
 }
 
 impl NotificationHandler for Comix {
