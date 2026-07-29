@@ -1,18 +1,17 @@
 // reference: https://github.com/nobottomline/extensions-source/blob/c8fe930f315f3baee23587559edfceab5e969202/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Signer.kt
-use crate::{BASE_URL, MIRROR_URL};
+use crate::{BASE_URL, MIRROR_URL, helpers::create_request_get, models::ErrorResponse};
 use aidoku::{
 	HashMap, Result,
-	alloc::string::String,
-	alloc::string::ToString,
-	alloc::vec::Vec,
+	alloc::{string::String, string::ToString, vec::Vec},
 	helpers::uri::QueryParameters,
-	imports::net::Response,
-	imports::{js::WebView, net::Request},
+	imports::{
+		js::WebView,
+		net::{Request, Response},
+	},
 	prelude::*,
 };
 use regex::Regex;
-use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 
 const GET_VMOBJ_JS: &str = "\
@@ -41,6 +40,11 @@ const JS_PATCHER: &str = "<head>\
 <script>window['__AIDOKU_CANVAS_TO_DATA_URL_TOKEN__'] = HTMLCanvasElement.prototype.toDataURL;</script>";
 
 const CF_CHALLENGE_ERROR_MESSAGE: &str = "Response returned CF challenge page instead of JSON data. If problem persist, please clear the source cache and restart the application to resolve this issue.";
+
+const WAF_CHALLENGE_KEY: &str = "captcha_required";
+/// Shown whenever the site's captcha (WAF) challenge is blocking us. It can only be cleared by
+/// the user solving it in a web view, so the message spells out exactly where that button is.
+const WAF_CHALLENGE_ERROR_MESSAGE: &str = "Comix requires captcha verification. Tap the \"\u{2026}\" button, choose Source Settings, then tap \"Verify Comix Captcha\" and solve the captcha. Verification expires after 30 minutes, so this may need to be repeated.";
 
 #[derive(Deserialize)]
 struct AxiosRequest {
@@ -85,13 +89,19 @@ impl ComixWebView {
 	}
 
 	fn try_load_webview(&mut self, base: &'static str) -> Result<()> {
-		self.web_view.load_html_blocking(
-			Request::get(base)?
-				.string()?
-				.replace("<head>", JS_PATCHER)
-				.as_str(),
-			Some(base),
-		)?;
+		let response = create_request_get(base)?.send()?;
+
+		let html = response.get_string()?;
+
+		// the site now serves a custom WAF challenge page; it can only be cleared by the user
+		// solving the captcha in a web view (source settings -> Verify Comix Captcha)
+		if Self::is_waf_challenge(&html) {
+			bail!("{}", WAF_CHALLENGE_ERROR_MESSAGE)
+		}
+
+		self.web_view
+			.load_html_blocking(html.replace("<head>", JS_PATCHER).as_str(), Some(base))?;
+
 		if self.find_functions().is_err() {
 			self.find_secure_module_src(base)?;
 			self.find_functions()?;
@@ -99,8 +109,14 @@ impl ComixWebView {
 		Ok(())
 	}
 
+	/// Whether a page is the site's captcha/WAF interstitial rather than the real site.
+	fn is_waf_challenge(html: &str) -> bool {
+		html.to_lowercase()
+			.contains("<title>security check</title>")
+	}
+
 	fn find_secure_module_src(&mut self, base: &str) -> Result<()> {
-		let main_module_src = Request::get(base)?
+		let main_module_src = create_request_get(base)?
 			.html()?
 			.select("head > script[type=\"module\"][src*=\"main\"]")
 			.and_then(|e| e.first())
@@ -110,16 +126,38 @@ impl ComixWebView {
 			let js_asset_path = &main_module_src[0..js_asset_path_index + 1];
 			let secure_script_regex = Regex::new("(secure-[A-Za-z0-9-_]+?\\.js)").unwrap();
 			let main_module_contents =
-				Request::get(format!("{base}{main_module_src}"))?.string()?;
+				create_request_get(&format!("{base}{main_module_src}"))?.string()?;
+			// this request can be challenged even when the page above wasn't
+			if Self::is_waf_challenge(&main_module_contents) {
+				bail!("{}", WAF_CHALLENGE_ERROR_MESSAGE)
+			}
 			if let Some(secure_script_path) = secure_script_regex
 				.captures(main_module_contents.as_str())
 				.and_then(|captures| captures.get(1).map(|m| m.as_str()))
 			{
+				// Fetch the signer module over the app's network stack (which carries the
+				// waf_pass/clearance cookies) and import it from a blob, rather than letting the
+				// web view import the remote url. The web view's own requests don't carry those
+				// cookies, so the site's WAF blocks them and `window.vm` ends up empty — which
+				// surfaces as "Failed to find installer function". The module is self-contained,
+				// so it has no relative imports that a blob url would break.
+				let secure_url = format!("{base}{js_asset_path}{secure_script_path}");
+				let secure_src = create_request_get(&secure_url)?.string()?;
+				if Self::is_waf_challenge(&secure_src) {
+					bail!("{}", WAF_CHALLENGE_ERROR_MESSAGE)
+				}
+				let secure_src_literal = serde_json::to_string(&secure_src)
+					.map_err(|e| error!("Failed to encode signer module: {e}"))?;
+
 				self.web_view.eval(&format!(
 					"(() => {{
-						import('{base}{js_asset_path}{secure_script_path}')
-						.then((m) => window['vm'] = m)
-						.catch((e) => window['vm'] = {{}});
+						try {{
+							const blob = new Blob([{secure_src_literal}], {{ type: 'text/javascript' }});
+							const blobUrl = URL.createObjectURL(blob);
+							import(blobUrl)
+								.then((m) => {{ window['vm'] = m; URL.revokeObjectURL(blobUrl); }})
+								.catch((e) => {{ window['vm'] = {{}}; URL.revokeObjectURL(blobUrl); }});
+						}} catch (e) {{ window['vm'] = {{}}; }}
 						return '';
 					}})()"
 				))?;
@@ -336,9 +374,9 @@ impl ComixWebView {
 
 		if let Some(params) = axios_request.params {
 			let query = build_query(&params);
-			Request::get(format!("{}?{query}", axios_request.url)).map_err(Into::into)
+			create_request_get(&format!("{}?{query}", axios_request.url))
 		} else {
-			Request::get(axios_request.url).map_err(Into::into)
+			create_request_get(&axios_request.url)
 		}
 	}
 
@@ -359,7 +397,14 @@ impl ComixWebView {
 		{
 			bail!("{CF_CHALLENGE_ERROR_MESSAGE}")
 		} else if status_code >= 400 {
-			bail!("Response Error: {}", status_code)
+			if response.status_code() == 403
+				&& serde_json::from_slice::<ErrorResponse>(&response.get_data()?)
+					.is_ok_and(|e| e.error == WAF_CHALLENGE_KEY)
+			{
+				bail!("{}", WAF_CHALLENGE_ERROR_MESSAGE)
+			} else {
+				bail!("Response Error: {}", response.status_code())
+			}
 		} else if response
 			.get_header("x-enc")
 			.is_some_and(|value| value == "1")
