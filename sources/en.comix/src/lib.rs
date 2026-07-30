@@ -26,8 +26,6 @@ use models::*;
 use web::*;
 
 const BASE_URL: &str = "https://comix.to";
-/// Official mirror, used as a fallback when the primary site is unreachable or blocked.
-const MIRROR_URL: &str = "https://comix.ws";
 const API_URL: &str = "https://comix.to/api/v1";
 
 const CONTENT_TYPES: &[&str] = &["manga", "manhwa", "manhua", "other"];

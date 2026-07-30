@@ -1,5 +1,5 @@
 // reference: https://github.com/nobottomline/extensions-source/blob/c8fe930f315f3baee23587559edfceab5e969202/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Signer.kt
-use crate::{BASE_URL, MIRROR_URL, helpers::create_request_get, models::ErrorResponse};
+use crate::{BASE_URL, helpers::create_request_get, models::ErrorResponse};
 use aidoku::{
 	HashMap, Result,
 	alloc::{string::String, string::ToString, vec::Vec},
@@ -61,9 +61,6 @@ struct DescrambleResponseObject {
 pub struct ComixWebView {
 	web_view: WebView,
 	is_initialized: bool,
-	/// The site base currently in use: BASE_URL normally, or MIRROR_URL when the
-	/// primary site couldn't be loaded (unreachable/blocked for this user).
-	active_base: &'static str,
 }
 
 impl ComixWebView {
@@ -71,19 +68,11 @@ impl ComixWebView {
 		Self {
 			web_view: WebView::new(),
 			is_initialized: false,
-			active_base: BASE_URL,
 		}
 	}
 
 	fn load_webview(&mut self) -> Result<()> {
-		// try the primary site first; if it can't be loaded (or the signer functions can't
-		// be found in what it returns, e.g. a block page), retry against the mirror
-		if self.try_load_webview(BASE_URL).is_ok() {
-			self.active_base = BASE_URL;
-		} else {
-			self.try_load_webview(MIRROR_URL)?;
-			self.active_base = MIRROR_URL;
-		}
+		self.try_load_webview(BASE_URL)?;
 		self.is_initialized = true;
 		Ok(())
 	}
@@ -259,16 +248,6 @@ impl ComixWebView {
 		if !self.is_initialized {
 			self.load_webview()?
 		}
-
-		// when the mirror is active, sign and send api requests against it — callers
-		// always build urls with the primary BASE_URL/API_URL constants
-		let mirrored_url: String;
-		let url = if self.active_base != BASE_URL && url.starts_with(BASE_URL) {
-			mirrored_url = url.replacen(BASE_URL, self.active_base, 1);
-			mirrored_url.as_str()
-		} else {
-			url
-		};
 
 		let result = self.web_view.eval(&format!(
 			"(() => {{
