@@ -124,13 +124,42 @@ impl ComixWebView {
 				.captures(main_module_contents.as_str())
 				.and_then(|captures| captures.get(1).map(|m| m.as_str()))
 			{
-				// Fetch the signer module over the app's network stack (which carries the
-				// waf_pass/clearance cookies) and import it from a blob, rather than letting the
-				// web view import the remote url. The web view's own requests don't carry those
-				// cookies, so the site's WAF blocks them and `window.vm` ends up empty — which
-				// surfaces as "Failed to find installer function". The module is self-contained,
-				// so it has no relative imports that a blob url would break.
+				// Import the module from its real url first. Importing it from a blob instead
+				// makes the descrambler silently draw nothing — `apply()` returns normally and
+				// leaves the canvas untouched, so pages render blank with no error. The module
+				// evidently checks where it was loaded from, and a `blob:` url fails that check.
+				//
+				// The blob path below is only a fallback for when the web view can't fetch the
+				// module itself: its requests don't carry the waf_pass/clearance cookies, so a
+				// WAF-challenged site blocks them and `window.vm` ends up empty, which surfaces
+				// as "Failed to find installer function". Trading a blank page for a real error
+				// is the right way round, so the blob is a last resort rather than the default.
 				let secure_url = format!("{base}{js_asset_path}{secure_script_path}");
+
+				self.web_view.eval(&format!(
+					"(() => {{
+						import('{secure_url}')
+							.then((m) => {{ window['vm'] = m; }})
+							.catch((e) => {{ window['vm'] = 'failed'; }});
+						return '';
+					}})()"
+				))?;
+				while self
+					.web_view
+					.eval("(() => { return window['vm'] == null ? 'true' : 'false'; })()")?
+					== "true"
+				{}
+
+				let direct_import_failed = self
+					.web_view
+					.eval("(() => { return window['vm'] === 'failed' ? 'true' : 'false'; })()")?
+					== "true";
+				if !direct_import_failed {
+					return Ok(());
+				}
+
+				// the web view couldn't load it (most likely the WAF blocked its cookie-less
+				// request) — fetch it over the app's network stack and import it from a blob
 				let secure_src = create_request_get(&secure_url)?.string()?;
 				if Self::is_waf_challenge(&secure_src) {
 					bail!("{}", WAF_CHALLENGE_ERROR_MESSAGE)
@@ -152,7 +181,7 @@ impl ComixWebView {
 				))?;
 				while self
 					.web_view
-					.eval("(() => { return window['vm'] == null ? 'true' : 'false'; })()")?
+					.eval("(() => { return window['vm'] === 'failed' ? 'true' : 'false'; })()")?
 					== "true"
 				{}
 				Ok(())
