@@ -15,7 +15,7 @@ pub fn request<T: DeserializeOwned>(url: &str) -> Result<T> {
 	let response = Request::get(url)?
 		.header("User-Agent", USER_AGENT)
 		.header("Accept", "application/json, text/plain, */*")
-		.header("Referer", "https://novelbuddy.com/")
+		.header("Referer", &format!("{BASE_URL}/"))
 		.header("Origin", BASE_URL)
 		.json_owned::<ApiResponse<T>>()?;
 	if !response.success {
@@ -98,7 +98,7 @@ impl From<TitleDetail> for Manga {
 
 impl From<ChapterListItem> for Chapter {
 	fn from(item: ChapterListItem) -> Self {
-		let chapter_number = parse_chapter_number(&item.name);
+		let chapter_number = item.number.or_else(|| parse_chapter_number(&item.name));
 		let date_uploaded = item.updated_at.as_deref().and_then(parse_iso_date);
 		let url = item.url.as_deref().map(absolute_url);
 		Chapter {
@@ -122,8 +122,8 @@ pub fn parse_status(value: &str) -> MangaStatus {
 	}
 }
 
-pub fn content_rating(is_adult: i32, tags: &[String]) -> ContentRating {
-	if is_adult != 0 {
+pub fn content_rating(is_adult: bool, tags: &[String]) -> ContentRating {
+	if is_adult {
 		return ContentRating::NSFW;
 	}
 	for tag in tags {

@@ -14,8 +14,13 @@ mod models;
 use helpers::{fetch_chapter_list, request, resolve_slug};
 use models::{ChapterDetailData, ListData, TitleDetailData, TrendingData};
 
-pub const BASE_URL: &str = "https://novelbuddy.com";
-pub const API_URL: &str = "https://api.novelbuddy.com";
+pub const BASE_URL: &str = "https://novelbuddy.me";
+pub const API_URL: &str = "https://api.novelbuddy.me";
+
+/// Domains the site has lived on, newest first. Deep links must keep matching
+/// the old ones: URLs saved before a migration still use them, and the old
+/// domains 301 to the current one.
+pub const KNOWN_DOMAINS: &[&str] = &["novelbuddy.me", "novelbuddy.com"];
 pub const USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 \
 	 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
 
@@ -159,12 +164,10 @@ impl ListingProvider for NovelBuddy {
 
 impl DeepLinkHandler for NovelBuddy {
 	fn handle_deep_link(&self, url: String) -> Result<Option<DeepLinkResult>> {
-		let path = url
-			.split(['?', '#'])
-			.next()
-			.unwrap_or(&url)
-			.rsplit("novelbuddy.com")
-			.next()
+		let without_query = url.split(['?', '#']).next().unwrap_or(&url);
+		let path = KNOWN_DOMAINS
+			.iter()
+			.find_map(|domain| without_query.split_once(domain).map(|(_, rest)| rest))
 			.unwrap_or("")
 			.trim_start_matches('/');
 		if path.is_empty() {
@@ -250,8 +253,10 @@ mod tests {
 			key: "VYPGVZ8z".into(),
 			..Default::default()
 		};
+		// The .me migration rebuilt the chapter table, so pre-migration chapter
+		// ids (e.g. 2ZejwbQD) are permanently dead. This is chapter 1's new id.
 		let chapter = Chapter {
-			key: "2ZejwbQD".into(),
+			key: "DoQwZ1K8".into(),
 			..Default::default()
 		};
 		let pages = source
@@ -273,13 +278,20 @@ mod tests {
 	#[aidoku_test]
 	fn deep_link_resolves_series() {
 		let source = NovelBuddy;
-		let result = source
-			.handle_deep_link("https://novelbuddy.com/shadow-slave".into())
-			.expect("deep link failed")
-			.expect("expected Some(DeepLinkResult)");
-		match result {
-			DeepLinkResult::Manga { key } => assert_eq!(key, "VYPGVZ8z"),
-			_ => panic!("expected Manga deep link"),
+		// Both the current domain and the pre-migration .com domain must resolve:
+		// saved/shared links predate the move.
+		for url in [
+			"https://novelbuddy.me/shadow-slave",
+			"https://novelbuddy.com/shadow-slave",
+		] {
+			let result = source
+				.handle_deep_link(url.into())
+				.expect("deep link failed")
+				.expect("expected Some(DeepLinkResult)");
+			match result {
+				DeepLinkResult::Manga { key } => assert_eq!(key, "VYPGVZ8z"),
+				_ => panic!("expected Manga deep link"),
+			}
 		}
 	}
 }
