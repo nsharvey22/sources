@@ -43,8 +43,10 @@ impl Source for FreeWebNovel {
 		let Some(query) = query.filter(|_| page <= 1) else {
 			return Ok(MangaPageResult::default());
 		};
+		// The site's search form renamed its query parameter from `searchkey`
+		// to `keyword`; the old name returns a resultless page, not an error.
 		let mut qs = QueryParameters::new();
-		qs.push("searchkey", Some(&query));
+		qs.push("keyword", Some(&query));
 		let url = format!("{BASE_URL}/search?{qs}");
 		let html = request_html(&url)?;
 		Ok(MangaPageResult {
