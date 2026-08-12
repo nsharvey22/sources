@@ -23,6 +23,13 @@ if (!vmObj || typeof vmObj !== 'object' || vmObj === window) {\
 
 const CANVAS_TO_DATA_URL_TOKEN: &str = "__AIDOKU_CANVAS_TO_DATA_URL_TOKEN__";
 
+// The secure module refuses to paint unless a 2x2 canvas serializes to this exact PNG.
+// WebKit's PNG encoder produces a different (but equally valid) representation, causing
+// `apply(canvas)` to return normally without drawing anything. This is only returned for the
+// module's 2x2, argument-less integrity probe; every real canvas serialization still uses the
+// original WebKit implementation captured before the module loads.
+const CANVAS_INTEGRITY_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
 const INSTALLER_REQUEST_TOKEN: &str = "__AIDOKU_INSTALLER_REQUEST_TOKEN__";
 const INSTALLER_RESPONSE_TOKEN: &str = "__AIDOKU_INSTALLER_RESPONSE_TOKEN__";
 
@@ -461,6 +468,24 @@ impl ComixWebView {
 			"(() => {{
 				window['{DESCRAMBLER_RESPONSE_TOKEN}'] = {EMPTY_DESCRAMBLER_RESPONSE_OBJECT};
 
+				// Comix gates its painter behind an exact canvas-encoding fingerprint. Limit
+				// the compatibility value to that 2x2 probe so image processing and output
+				// continue to use WebKit's real toDataURL implementation.
+				const applyDescrambler = (data, canvas) => {{
+					const currentToDataURL = HTMLCanvasElement.prototype.toDataURL;
+					try {{
+						HTMLCanvasElement.prototype.toDataURL = function (...args) {{
+							if (this.width === 2 && this.height === 2 && args.length === 0) {{
+								return '{CANVAS_INTEGRITY_DATA_URL}';
+							}}
+							return currentToDataURL.apply(this, args);
+						}};
+						data.apply(canvas);
+					}} finally {{
+						HTMLCanvasElement.prototype.toDataURL = currentToDataURL;
+					}}
+				}};
+
 				const controller = new AbortController();
                 const signal = controller.signal;
 
@@ -486,7 +511,7 @@ impl ComixWebView {
 										image.onerror = reject;
 									}})
 								}} else if (data.mode === 'canvas') {{
-									data.apply(canvas)
+									applyDescrambler(data, canvas)
 									const output = window['{CANVAS_TO_DATA_URL_TOKEN}'].call(canvas);
 									window['{DESCRAMBLER_RESPONSE_TOKEN}'].data = output;
 									window['{DESCRAMBLER_RESPONSE_TOKEN}'].isDone = true;
@@ -496,7 +521,7 @@ impl ComixWebView {
 								}}
 								return null;
 							}} else if (typeof data === 'object' && data.apply && typeof data.apply === 'function') {{
-								data.apply(canvas)
+								applyDescrambler(data, canvas)
 								const output = window['{CANVAS_TO_DATA_URL_TOKEN}'].call(canvas);
 								window['{DESCRAMBLER_RESPONSE_TOKEN}'].data = output;
 								window['{DESCRAMBLER_RESPONSE_TOKEN}'].isDone = true;
