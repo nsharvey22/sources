@@ -650,7 +650,7 @@ const VERIFY_COOKIE_KEY: &str = "waf_pass";
 impl WebLoginHandler for Comix {
 	fn handle_web_login(&self, key: String, cookies: HashMap<String, String>) -> Result<bool> {
 		if key == "verify" {
-			// This is verifying button not to be confused with actual login button.
+			// This is the verification button, not the actual login button.
 			// We need to intercept waf_pass cookie so that we can pass the checks.
 			// This will not log you in even if you do the login page afterward.
 			return Ok(cookies.get(VERIFY_COOKIE_KEY).is_some_and(|pass| {
