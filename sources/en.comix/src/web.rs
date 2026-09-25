@@ -46,7 +46,8 @@ const FETCH_TIMEOUT_RESPONSE: &str =
 const JS_PATCHER: &str = "<head>\
 <script>window['__AIDOKU_CANVAS_TO_DATA_URL_TOKEN__'] = HTMLCanvasElement.prototype.toDataURL;</script>";
 
-const CF_CHALLENGE_ERROR_MESSAGE: &str = "Response returned CF challenge page instead of JSON data. If problem persist, please clear the source cache and restart the application to resolve this issue.";
+const CF_CHALLENGE_ERROR_MESSAGE: &str = "Comix returned a Cloudflare challenge instead of data. Try switching to cellular data or using a VPN, then reload the source.";
+const CF_BLOCK_ERROR_MESSAGE: &str = "Comix was blocked by Cloudflare on this network. Try switching to cellular data or using a VPN, then reload the source.";
 
 const WAF_CHALLENGE_KEY: &str = "captcha_required";
 /// Shown whenever the site's captcha (WAF) challenge is blocking us. It can only be cleared by
@@ -89,6 +90,10 @@ impl ComixWebView {
 
 		let html = response.get_string()?;
 
+		if Self::is_cloudflare_block(&html) {
+			bail!("{}", CF_BLOCK_ERROR_MESSAGE)
+		}
+
 		// the site now serves a custom WAF challenge page; it can only be cleared by the user
 		// solving the captcha in a web view (source settings -> Verify Comix Captcha)
 		if Self::is_waf_challenge(&html) {
@@ -111,9 +116,25 @@ impl ComixWebView {
 			.contains("<title>security check</title>")
 	}
 
+	/// Whether Cloudflare rejected the network outright instead of serving a solvable challenge.
+	fn is_cloudflare_block(html: &str) -> bool {
+		let html = html.to_lowercase();
+		html.contains("<title>attention required! | cloudflare</title>")
+			|| html.contains("id=\"cf-error-details\"")
+			|| html.contains("sorry, you have been blocked")
+	}
+
 	fn find_secure_module_src(&mut self, base: &str) -> Result<()> {
-		let main_module_src = create_request_get(base)?
-			.html()?
+		let response = create_request_get(base)?.send()?;
+		let html = response.get_string()?;
+		if Self::is_cloudflare_block(&html) {
+			bail!("{}", CF_BLOCK_ERROR_MESSAGE)
+		}
+		if Self::is_waf_challenge(&html) {
+			bail!("{}", WAF_CHALLENGE_ERROR_MESSAGE)
+		}
+		let main_module_src = response
+			.get_html()?
 			.select("head > script[type=\"module\"][src*=\"main\"]")
 			.and_then(|e| e.first())
 			.and_then(|e| e.attr("src"))
@@ -123,6 +144,9 @@ impl ComixWebView {
 			let secure_script_regex = Regex::new("(secure-[A-Za-z0-9-_]+?\\.js)").unwrap();
 			let main_module_contents =
 				create_request_get(&format!("{base}{main_module_src}"))?.string()?;
+			if Self::is_cloudflare_block(&main_module_contents) {
+				bail!("{}", CF_BLOCK_ERROR_MESSAGE)
+			}
 			// this request can be challenged even when the page above wasn't
 			if Self::is_waf_challenge(&main_module_contents) {
 				bail!("{}", WAF_CHALLENGE_ERROR_MESSAGE)
@@ -168,6 +192,9 @@ impl ComixWebView {
 				// the web view couldn't load it (most likely the WAF blocked its cookie-less
 				// request) — fetch it over the app's network stack and import it from a blob
 				let secure_src = create_request_get(&secure_url)?.string()?;
+				if Self::is_cloudflare_block(&secure_src) {
+					bail!("{}", CF_BLOCK_ERROR_MESSAGE)
+				}
 				if Self::is_waf_challenge(&secure_src) {
 					bail!("{}", WAF_CHALLENGE_ERROR_MESSAGE)
 				}
@@ -623,5 +650,21 @@ impl ComixWebView {
 		}
 
 		json.data.ok_or(error!("Fetch data is null"))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use aidoku_test::aidoku_test;
+
+	#[aidoku_test]
+	fn recognizes_cloudflare_hard_block() {
+		assert!(ComixWebView::is_cloudflare_block(
+			"<title>Attention Required! | Cloudflare</title><div id=\"cf-error-details\">"
+		));
+		assert!(!ComixWebView::is_cloudflare_block(
+			"<title>Comix - Read Comics online for free</title>"
+		));
 	}
 }
