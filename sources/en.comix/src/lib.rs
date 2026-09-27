@@ -7,7 +7,7 @@ use aidoku::{
 	alloc::{String, Vec, string::ToString, vec},
 	helpers::uri::{QueryParameters, encode_uri_component},
 	imports::{
-		canvas::ImageRef,
+		canvas::{Canvas, ImageRef, Rect},
 		net::{Request, RequestError, Response},
 		std::{current_date, send_partial_result},
 	},
@@ -282,11 +282,19 @@ impl Source for Comix {
 			.items
 			.into_iter()
 			.map(|page| {
-				let url = if page.url.starts_with("http") {
+				let mut url = if page.url.starts_with("http") {
 					page.url
 				} else {
 					format!("{base_url}/{}", page.url.trim_start_matches('/'))
 				};
+				if page.s == Some(1)
+					&& !url.split('?').skip(1).any(|q| {
+						q.split('&')
+							.any(|item| item == "v3" || item.starts_with("v3="))
+					}) {
+					url.push(if url.contains('?') { '&' } else { '?' });
+					url.push_str("v3");
+				}
 				Page {
 					content: if let Some(s) = page.s {
 						let mut context = PageContext::new();
@@ -529,10 +537,14 @@ impl PageImageProcessor for Comix {
 			.as_ref()
 			.is_some_and(|c| c.get("s").is_some_and(|s| s == "1"));
 
-		// Scrambled pages: the JS descrambler fetches the image itself and depends on the exact
-		// recorded URL (its scramble seed/hash are path-specific), so we must NOT rewrite it.
-		// This matches the previous behavior — the descrambler handles the fetch as before.
+		// Current v3 pages carry a 5x5 tile order in x-scramble-* response headers and are
+		// restored natively. Keep the legacy JS path as a fallback for older responses that do
+		// not include those headers; it depends on the exact recorded URL.
 		if is_scrambled {
+			if let Some(image) = descramble_v3_grid(&response) {
+				return Ok(image);
+			}
+
 			let Some(context) = context else {
 				bail!("Unable to get the page context")
 			};
@@ -585,6 +597,107 @@ impl PageImageProcessor for Comix {
 			Ok(response.image)
 		}
 	}
+}
+
+const GRID_COLS: usize = 5;
+const GRID_ROWS: usize = 5;
+const GRID_TILES: usize = GRID_COLS * GRID_ROWS;
+const LCG_MULTIPLIER: u32 = 1_664_525;
+const LCG_INCREMENT: u32 = 1_013_904_223;
+
+fn image_header<'a>(response: &'a ImageResponse, name: &str) -> Option<&'a str> {
+	response
+		.headers
+		.iter()
+		.find(|(key, _)| key.eq_ignore_ascii_case(name))
+		.map(|(_, value)| value.as_str())
+}
+
+fn descramble_v3_grid(response: &ImageResponse) -> Option<ImageRef> {
+	if image_header(response, "x-scramble-grid") != Some("5x5") {
+		return None;
+	}
+
+	let algorithm = image_header(response, "x-scramble-algo");
+	if !matches!(algorithm, None | Some("1" | "2" | "3")) {
+		return None;
+	}
+
+	let seed = image_header(response, "x-scramble-seed")?
+		.parse::<i64>()
+		.ok()? as i32;
+	if seed == 0 {
+		return None;
+	}
+	let hash = match image_header(response, "x-scramble-hash").map(str::trim) {
+		Some("03632") => 58_414,
+		Some("02900") => 117_532,
+		_ => 0,
+	};
+	let mixed_seed = seed ^ hash;
+	let order = if algorithm == Some("3") {
+		build_xorshift_order(mixed_seed, GRID_TILES)
+	} else {
+		build_lcg_order(mixed_seed, GRID_TILES)
+	};
+
+	let width = response.image.width();
+	let height = response.image.height();
+	let tile_width = (width as u32 / GRID_COLS as u32) as f32;
+	let tile_height = (height as u32 / GRID_ROWS as u32) as f32;
+	if tile_width == 0.0 || tile_height == 0.0 {
+		return None;
+	}
+
+	let mut canvas = Canvas::new(width, height);
+	// Preserve remainder pixels at the right and bottom when dimensions are not divisible by 5.
+	canvas.draw_image(&response.image, Rect::new(0.0, 0.0, width, height));
+	for (destination, source) in order.into_iter().enumerate() {
+		let source_x = (source % GRID_COLS) as f32 * tile_width;
+		let source_y = (source / GRID_COLS) as f32 * tile_height;
+		let destination_x = (destination % GRID_COLS) as f32 * tile_width;
+		let destination_y = (destination / GRID_COLS) as f32 * tile_height;
+		canvas.copy_image(
+			&response.image,
+			Rect::new(source_x, source_y, tile_width, tile_height),
+			Rect::new(destination_x, destination_y, tile_width, tile_height),
+		);
+	}
+	Some(canvas.get_image())
+}
+
+fn inverse_order(shuffled: Vec<usize>) -> Vec<usize> {
+	let mut inverse = vec![0; shuffled.len()];
+	for (index, value) in shuffled.into_iter().enumerate() {
+		inverse[value] = index;
+	}
+	inverse
+}
+
+fn build_xorshift_order(seed: i32, count: usize) -> Vec<usize> {
+	let mut shuffled: Vec<usize> = (0..count).collect();
+	let mut state = seed as u32 | 1;
+	for index in (1..count).rev() {
+		state ^= state.wrapping_shl(13);
+		state ^= state.wrapping_shr(17);
+		state ^= state.wrapping_shl(5);
+		let swap_index = state as usize % (index + 1);
+		shuffled.swap(index, swap_index);
+	}
+	inverse_order(shuffled)
+}
+
+fn build_lcg_order(seed: i32, count: usize) -> Vec<usize> {
+	let mut shuffled: Vec<usize> = (0..count).collect();
+	let mut state = seed as u32;
+	for index in (1..count).rev() {
+		state = state
+			.wrapping_mul(LCG_MULTIPLIER)
+			.wrapping_add(LCG_INCREMENT);
+		let swap_index = state as usize % (index + 1);
+		shuffled.swap(index, swap_index);
+	}
+	inverse_order(shuffled)
 }
 
 /// Alternate CDN path segments for page images; the site's own client retries these when
@@ -676,3 +789,31 @@ register_source!(
 	DeepLinkHandler,
 	WebLoginHandler
 );
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use aidoku_test::aidoku_test;
+
+	#[aidoku_test]
+	fn builds_xorshift_scramble_order() {
+		assert_eq!(
+			build_xorshift_order(123_456_789, 25),
+			vec![
+				16, 5, 22, 14, 7, 20, 24, 13, 21, 4, 15, 3, 23, 0, 11, 18, 12, 1, 10, 17, 8, 9, 6,
+				19, 2,
+			]
+		);
+	}
+
+	#[aidoku_test]
+	fn builds_lcg_scramble_order() {
+		assert_eq!(
+			build_lcg_order(123_456_789, 25),
+			vec![
+				2, 16, 6, 19, 14, 18, 12, 24, 10, 9, 8, 17, 0, 13, 3, 11, 1, 20, 4, 22, 7, 21, 5,
+				23, 15,
+			]
+		);
+	}
+}

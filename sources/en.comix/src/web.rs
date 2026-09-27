@@ -295,15 +295,12 @@ impl ComixWebView {
 		}})()",
 		))?;
 		let expr: Vec<&str> = result.split("||").collect();
-		if expr.is_empty() {
-			bail!("Failed to find installer and descrambler functions")
-		}
-		if expr[0].is_empty() {
+		if expr.is_empty() || expr[0].is_empty() {
 			bail!("Failed to find installer function");
 		}
-		if expr.len() < 3 || expr[1].is_empty() && expr[2].is_empty() {
-			bail!("Failed to find descrambler canvas/blob function");
-		}
+		// Comix's current secure module keeps the request installer but no longer exports the
+		// legacy canvas/blob descrambler. Current v3 images are restored natively from their
+		// x-scramble-* response headers in process_page_image.
 		Ok(())
 	}
 
