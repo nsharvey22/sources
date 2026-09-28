@@ -3,17 +3,16 @@ use aidoku::{
 	Chapter, DeepLinkHandler, DeepLinkResult, FilterValue, HashMap, Home, HomeComponent,
 	HomeLayout, HomePartialResult, ImageRequestProvider, ImageResponse, Link, LinkValue, Listing,
 	ListingProvider, Manga, MangaPageResult, MangaWithChapter, NotificationHandler, Page,
-	PageContent, PageContext, PageImageProcessor, Result, Source, WebLoginHandler,
+	PageContent, PageContext, PageImageProcessor, Result, Source,
 	alloc::{String, Vec, string::ToString, vec},
 	helpers::uri::{QueryParameters, encode_uri_component},
 	imports::{
 		canvas::{Canvas, ImageRef, Rect},
-		net::{Request, RequestError, Response},
-		std::{current_date, send_partial_result},
+		net::Request,
+		std::send_partial_result,
 	},
 	prelude::*,
 };
-use base64::{Engine, engine::general_purpose};
 use core::cell::RefCell;
 
 mod helpers;
@@ -25,15 +24,38 @@ use crate::helpers::create_request_get;
 use models::*;
 use web::*;
 
-const BASE_URL: &str = "https://comix.to";
-const API_URL: &str = "https://comix.to/api/v1";
-
 const CONTENT_TYPES: &[&str] = &["manga", "manhwa", "manhua", "other"];
 // adult, boys love, ecchi, girls love, hentai, smut
 const NSFW_GENRE_IDS: &[&str] = &["87264", "8", "87265", "13", "87266", "87268"];
 
 struct Comix {
 	web_view: RefCell<ComixWebView>,
+}
+
+fn selected_source_url(url: Option<&str>, fallback_path: &str) -> String {
+	let path = url
+		.and_then(|url| url.split_once("://"))
+		.and_then(|(_, rest)| rest.split_once('/'))
+		.map(|(_, path)| path)
+		.unwrap_or(fallback_path)
+		.trim_start_matches('/');
+	format!("{}/{path}", settings::base_url())
+}
+
+fn fetch_search_response(
+	web_view: &mut ComixWebView,
+	signed_url: &str,
+	browse_url: &str,
+) -> Result<SearchResponse> {
+	if web_view.has_signer()
+		&& let Ok(response) = web_view
+			.build_request(signed_url)
+			.and_then(|request| Ok(request.send()?))
+		&& let Ok(result) = web_view.decode_json_owned::<SearchResponse>(&response)
+	{
+		return Ok(result);
+	}
+	web_view.fetch_browse(browse_url)
 }
 
 impl Source for Comix {
@@ -50,6 +72,7 @@ impl Source for Comix {
 		filters: Vec<FilterValue>,
 	) -> Result<MangaPageResult> {
 		let mut web_view = self.web_view.borrow_mut();
+		let api_url = settings::api_url();
 
 		let mut qs = QueryParameters::new();
 		qs.push("page", Some(&page.to_string()));
@@ -69,18 +92,17 @@ impl Source for Comix {
 			match filter {
 				FilterValue::Text { id, value } => {
 					let url = format!(
-						"{API_URL}/terms?type={id}&keyword={}&limit=1",
+						"{api_url}/tags/search?type={id}&q={}",
 						encode_uri_component(value)
 					);
-					let response = web_view.build_request(&url)?.send()?;
-					web_view
-						.decode_json_owned::<TermResponse>(&response)?
-						.result
-						.items
-						.first()
-						.map(|t| t.id)
-						.ok_or_else(|| error!("No matching {id}s"))?;
-					qs.push(&format!("{id}s[]"), Some(&id.to_string()));
+					let response = create_request_get(&url)?.send()?;
+					let term_id =
+						serde_json::from_str::<TagSearchResponse>(&response.get_string()?)?
+							.result
+							.first()
+							.map(|t| t.id)
+							.ok_or_else(|| error!("No matching {id}s"))?;
+					qs.push(&format!("{id}s[]"), Some(&term_id.to_string()));
 				}
 				FilterValue::Sort {
 					id,
@@ -177,11 +199,9 @@ impl Source for Comix {
 			}
 		}
 
-		let url = format!("{API_URL}/manga?{qs}");
-		let response = web_view.build_request(&url)?.send()?;
-		web_view
-			.decode_json_owned::<SearchResponse>(&response)
-			.map(Into::into)
+		let signed_url = format!("{api_url}/manga?{qs}");
+		let browse_url = format!("{}/browse?{qs}", settings::base_url());
+		fetch_search_response(&mut web_view, &signed_url, &browse_url).map(Into::into)
 	}
 
 	fn get_manga_update(
@@ -191,10 +211,11 @@ impl Source for Comix {
 		needs_chapters: bool,
 	) -> Result<Manga> {
 		let mut web_view = self.web_view.borrow_mut();
+		let api_url = settings::api_url();
 
 		if needs_details {
-			let url = format!(
-				"{API_URL}/manga/{}?includes[]=demographic\
+			let signed_url = format!(
+				"{api_url}/manga/{}?includes[]=demographic\
 									&includes[]=genre\
 									&includes[]=theme\
 									&includes[]=author\
@@ -202,10 +223,22 @@ impl Source for Comix {
 									&includes[]=publisher",
 				manga.key
 			);
-			let response = web_view.build_request(&url)?.send()?;
-			let json: SingleMangaResponse = web_view.decode_json_owned(&response)?;
+			let page_url =
+				selected_source_url(manga.url.as_deref(), &format!("title/{}", manga.key));
+			let detail = if web_view.has_signer() {
+				web_view
+					.build_request(&signed_url)
+					.and_then(|request| Ok(request.send()?))
+					.and_then(|response| {
+						web_view.decode_json_owned::<SingleMangaResponse>(&response)
+					})
+					.map(|response| response.result)
+					.or_else(|_| web_view.fetch_manga(&page_url))?
+			} else {
+				web_view.fetch_manga(&page_url)?
+			};
 
-			manga.copy_from(json.result.into());
+			manga.copy_from(detail.into());
 
 			if needs_chapters {
 				send_partial_result(&manga);
@@ -213,37 +246,42 @@ impl Source for Comix {
 		}
 
 		if needs_chapters {
-			let limit = 100;
-			let mut page = 1;
 			let deduplicate = settings::dedupchapter();
 			let mut chapter_map: HashMap<String, ComixChapter> = HashMap::new();
-			let mut chapter_list: Vec<ComixChapter> = Vec::new();
-
-			loop {
-				let mut params = QueryParameters::new();
-				params.push("limit", Some(limit.to_string().as_str()));
-				params.push("page", Some(page.to_string().as_str()));
-				params.push("order[number]", Some("desc"));
-
-				let url = format!("{API_URL}/manga/{}/chapters?{params}", manga.key);
-				let response = web_view.build_request(&url)?.send()?;
-				let res = web_view.decode_json_owned::<ChapterDetailsResponse>(&response)?;
-
-				let items = res.result.items;
-
-				if deduplicate {
-					for item in items {
-						helpers::dedup_insert(&mut chapter_map, item);
+			let page_url =
+				selected_source_url(manga.url.as_deref(), &format!("title/{}", manga.key));
+			let has_signer = web_view.has_signer();
+			let mut fetch_signed = || -> Result<Vec<ComixChapter>> {
+				let mut page = 1;
+				let mut chapters = Vec::new();
+				loop {
+					let mut params = QueryParameters::new();
+					params.push("limit", Some("100"));
+					params.push("page", Some(page.to_string().as_str()));
+					params.push("order[number]", Some("desc"));
+					let url = format!("{api_url}/manga/{}/chapters?{params}", manga.key);
+					let response = web_view.build_request(&url)?.send()?;
+					let response =
+						web_view.decode_json_owned::<ChapterDetailsResponse>(&response)?;
+					let last_page = response.result.meta.last_page;
+					chapters.extend(response.result.items);
+					if page >= last_page {
+						break;
 					}
-				} else {
-					chapter_list.extend(items);
+					page += 1;
 				}
+				Ok(chapters)
+			};
+			let mut chapter_list = if has_signer {
+				fetch_signed().or_else(|_| web_view.fetch_chapters(&page_url, &manga.key))?
+			} else {
+				web_view.fetch_chapters(&page_url, &manga.key)?
+			};
 
-				if res.result.meta.page >= res.result.meta.last_page {
-					break;
+			if deduplicate {
+				for item in chapter_list.drain(..) {
+					helpers::dedup_insert(&mut chapter_map, item);
 				}
-
-				page += 1;
 			}
 
 			let mut chapters: Vec<Chapter> = if deduplicate {
@@ -266,11 +304,22 @@ impl Source for Comix {
 		Ok(manga)
 	}
 
-	fn get_page_list(&self, _manga: Manga, chapter: Chapter) -> Result<Vec<Page>> {
+	fn get_page_list(&self, manga: Manga, chapter: Chapter) -> Result<Vec<Page>> {
 		let mut web_view = self.web_view.borrow_mut();
-		let url = format!("{API_URL}/chapters/{}", chapter.key);
-		let response = web_view.build_request(&url)?.send()?;
-		let json: ChapterResponse = web_view.decode_json_owned(&response)?;
+		let signed_url = format!("{}/chapters/{}", settings::api_url(), chapter.key);
+		let page_url = selected_source_url(
+			chapter.url.as_deref(),
+			&format!("title/{}/{}", manga.key, chapter.key),
+		);
+		let json = if web_view.has_signer() {
+			web_view
+				.build_request(&signed_url)
+				.and_then(|request| Ok(request.send()?))
+				.and_then(|response| web_view.decode_json_owned::<ChapterResponse>(&response))
+				.or_else(|_| web_view.fetch_pages(&page_url))?
+		} else {
+			web_view.fetch_pages(&page_url)?
+		};
 
 		let Some(result) = json.result else {
 			bail!("Missing chapter")
@@ -281,13 +330,20 @@ impl Source for Comix {
 			.pages
 			.items
 			.into_iter()
-			.map(|page| {
+			.enumerate()
+			.map(|(index, page)| {
 				let mut url = if page.url.starts_with("http") {
 					page.url
 				} else {
 					format!("{base_url}/{}", page.url.trim_start_matches('/'))
 				};
-				if page.s == Some(1)
+				let is_v3 = page.s == Some(1)
+					|| url.split('?').skip(1).any(|query| {
+						query
+							.split('&')
+							.any(|item| item == "v3" || item.starts_with("v3="))
+					});
+				if is_v3
 					&& !url.split('?').skip(1).any(|q| {
 						q.split('&')
 							.any(|item| item == "v3" || item.starts_with("v3="))
@@ -295,10 +351,18 @@ impl Source for Comix {
 					url.push(if url.contains('?') { '&' } else { '?' });
 					url.push_str("v3");
 				}
+				// Current legacy pages encrypt every fourth image. They do not advertise this in
+				// the page DTO; the Origin header causes the CDN to return x-enc-* metadata.
+				let is_legacy_scramble = is_legacy_scramble_page(index, is_v3);
 				Page {
-					content: if let Some(s) = page.s {
+					content: if is_v3 || page.s.is_some() || is_legacy_scramble {
 						let mut context = PageContext::new();
-						context.insert("s".into(), s.to_string());
+						if is_v3 {
+							context.insert("s".into(), "1".into());
+						}
+						if is_legacy_scramble {
+							context.insert("legacy_scramble".into(), "1".into());
+						}
 						context.insert("width".into(), page.width.to_string());
 						context.insert("height".into(), page.height.to_string());
 						PageContent::url_context(url, context)
@@ -314,6 +378,7 @@ impl Source for Comix {
 
 impl Home for Comix {
 	fn get_home(&self) -> Result<HomeLayout> {
+		let api_url = settings::api_url();
 		// send basic layout
 		send_partial_result(&HomePartialResult::Layout(HomeLayout {
 			components: vec![
@@ -353,37 +418,36 @@ impl Home for Comix {
 		let hidden_terms = settings::hidden_terms();
 
 		let mut web_view = self.web_view.borrow_mut();
-
-		let responses: [core::result::Result<Response, RequestError>; 4] = Request::send_all([
-			// most recent popular
-			web_view.build_request(&format!(
-				"{API_URL}/manga/top?type=trending&days=1&limit=20{extra_qs}"
-			))?,
-			// most follows new comics
-			web_view.build_request(&format!(
-				"{API_URL}/manga/top?type=follows&days=1&limit=20{extra_qs}"
-			))?,
-			// latest updates (hot)
-			web_view.build_request(&format!(
-				"{API_URL}/manga?scope=hot&limit=30&order[chapter_updated_at]=desc&page=1{extra_qs}"
-			))?,
-			// recently added
-			web_view.build_request(&format!(
-				"{API_URL}/manga?order[created_at]=desc&limit=10&page=1{extra_qs}"
-			))?,
-		])
-		.try_into()
-		.expect("requests vec length should be 4");
-
-		let [popular_res, follows_res, latest_res, recent_res] = responses;
+		let base_url = settings::base_url();
+		let popular_res = fetch_search_response(
+			&mut web_view,
+			&format!("{api_url}/manga/top?type=trending&days=1&limit=20{extra_qs}"),
+			&format!("{base_url}/browse?order[views_7d]=desc&page=1{extra_qs}"),
+		)?;
+		let follows_res = fetch_search_response(
+			&mut web_view,
+			&format!("{api_url}/manga/top?type=follows&days=1&limit=20{extra_qs}"),
+			&format!("{base_url}/browse?order[follows_total]=desc&page=1{extra_qs}"),
+		)?;
+		let latest_res = fetch_search_response(
+			&mut web_view,
+			&format!(
+				"{api_url}/manga?scope=hot&limit=30&order[chapter_updated_at]=desc&page=1{extra_qs}"
+			),
+			&format!("{base_url}/browse?order[chapter_updated_at]=desc&page=1{extra_qs}"),
+		)?;
+		let recent_res = fetch_search_response(
+			&mut web_view,
+			&format!("{api_url}/manga?order[created_at]=desc&limit=10&page=1{extra_qs}"),
+			&format!("{base_url}/browse?order[created_at]=desc&page=1{extra_qs}"),
+		)?;
 
 		for (response, title) in [
 			(popular_res, "Most Recent Popular"),
 			(follows_res, "Most Follows New Comics"),
 			(latest_res, "Latest Updates (Hot)"),
 		] {
-			let entries = web_view
-				.decode_json_owned::<SearchResponse>(&response?)?
+			let entries = response
 				.result
 				.items
 				.into_iter()
@@ -413,8 +477,7 @@ impl Home for Comix {
 		}
 
 		{
-			let entries = web_view
-				.decode_json_owned::<SearchResponse>(&recent_res?)?
+			let entries = recent_res
 				.result
 				.items
 				.into_iter()
@@ -453,6 +516,8 @@ impl Home for Comix {
 
 impl ListingProvider for Comix {
 	fn get_manga_list(&self, listing: Listing, page: i32) -> Result<MangaPageResult> {
+		let api_url = settings::api_url();
+		let base_url = settings::base_url();
 		let trending = |types: Vec<String>| {
 			self.get_search_manga_list(
 				None,
@@ -472,7 +537,11 @@ impl ListingProvider for Comix {
 			)
 		};
 
-		fn get_listing_page(comix: &Comix, url: &str) -> Result<MangaPageResult> {
+		fn get_listing_page(
+			comix: &Comix,
+			signed_url: &str,
+			browse_url: &str,
+		) -> Result<MangaPageResult> {
 			let extra_qs = if settings::hide_nsfw() {
 				NSFW_GENRE_IDS
 					.iter()
@@ -483,12 +552,11 @@ impl ListingProvider for Comix {
 			};
 			let hidden_types = settings::hidden_types();
 			let hidden_terms = settings::hidden_terms();
-			let url = format!("{url}{extra_qs}");
+			let signed_url = format!("{signed_url}{extra_qs}");
+			let browse_url = format!("{browse_url}{extra_qs}");
 			let mut web_view = comix.web_view.borrow_mut();
 
-			let response = web_view.build_request(&url)?.send()?;
-			web_view
-				.decode_json_owned::<SearchResponse>(&response)
+			fetch_search_response(&mut web_view, &signed_url, &browse_url)
 				.map(|r| r.result.into_filtered(&hidden_types, &hidden_terms))
 		}
 
@@ -498,22 +566,26 @@ impl ListingProvider for Comix {
 
 			"Most Recent Popular" => get_listing_page(
 				self,
-				&format!("{API_URL}/manga/top?type=trending&days=1&limit=50"),
+				&format!("{api_url}/manga/top?type=trending&days=1&limit=50"),
+				&format!("{base_url}/browse?order[views_7d]=desc&page={page}"),
 			),
 			"Most Follows New Comics" => get_listing_page(
 				self,
-				&format!("{API_URL}/manga/top?type=follows&days=1&limit=50"),
+				&format!("{api_url}/manga/top?type=follows&days=1&limit=50"),
+				&format!("{base_url}/browse?order[follows_total]=desc&page={page}"),
 			),
 
 			"Latest Updates (Hot)" => get_listing_page(
 				self,
 				&format!(
-					"{API_URL}/manga?scope=hot&limit=30&order[chapter_updated_at]=desc&page={page}"
+					"{api_url}/manga?scope=hot&limit=30&order[chapter_updated_at]=desc&page={page}"
 				),
+				&format!("{base_url}/browse?order[chapter_updated_at]=desc&page={page}"),
 			),
 			"Recently Added" => get_listing_page(
 				self,
-				&format!("{API_URL}/manga?order[created_at]=desc&limit=30&page={page}"),
+				&format!("{api_url}/manga?order[created_at]=desc&limit=30&page={page}"),
+				&format!("{base_url}/browse?order[created_at]=desc&page={page}"),
 			),
 
 			_ => bail!("Unknown listing"),
@@ -522,8 +594,18 @@ impl ListingProvider for Comix {
 }
 
 impl ImageRequestProvider for Comix {
-	fn get_image_request(&self, url: String, _context: Option<PageContext>) -> Result<Request> {
-		Ok(create_request_get(&url)?.header("Referer", &format!("{BASE_URL}/")))
+	fn get_image_request(&self, url: String, context: Option<PageContext>) -> Result<Request> {
+		let mut request = Request::get(&url)?
+			.header("Accept", "*/*")
+			.header("Referer", &format!("{}/", settings::base_url()));
+		if context.as_ref().is_some_and(|context| {
+			context
+				.get("legacy_scramble")
+				.is_some_and(|value| value == "1")
+		}) {
+			request = request.header("Origin", &settings::base_url());
+		}
+		Ok(request)
 	}
 }
 
@@ -533,45 +615,31 @@ impl PageImageProcessor for Comix {
 		response: ImageResponse,
 		context: Option<PageContext>,
 	) -> Result<ImageRef> {
-		let is_scrambled = context
-			.as_ref()
-			.is_some_and(|c| c.get("s").is_some_and(|s| s == "1"));
+		if response.code >= 400 {
+			bail!(
+				"Comix's image CDN was blocked on this network. Try the other Website Domain in Source Settings, switch to cellular data, or use a VPN, then reload the chapter."
+			)
+		}
 
-		// Current v3 pages carry a 5x5 tile order in x-scramble-* response headers and are
-		// restored natively. Keep the legacy JS path as a fallback for older responses that do
-		// not include those headers; it depends on the exact recorded URL.
+		let is_scrambled = context.as_ref().is_some_and(|context| {
+			context.get("s").is_some_and(|value| value == "1")
+				|| context
+					.get("legacy_scramble")
+					.is_some_and(|value| value == "1")
+		});
+
+		// Current pages use native x-enc-* byte encryption, x-scramble-* tile scrambling, or
+		// both. The site's secure module no longer reliably exports a legacy descrambler, so
+		// decode the response metadata directly, matching the current web client behavior.
 		if is_scrambled {
-			if let Some(image) = descramble_v3_grid(&response) {
+			if let Some(image) = decode_page_image(&response) {
 				return Ok(image);
 			}
 
-			let Some(context) = context else {
-				bail!("Unable to get the page context")
-			};
-
-			let Some(url) = response.request.url else {
-				bail!("Unable to get the image url")
-			};
-
-			let Some(width) = context.get("width").and_then(|s| s.parse::<f32>().ok()) else {
-				bail!("Unable to get the image width")
-			};
-
-			let Some(height) = context.get("height").and_then(|s| s.parse::<f32>().ok()) else {
-				bail!("Unable to get the image height")
-			};
-
-			let mut web_view = self.web_view.borrow_mut();
-
-			let data_url = web_view.descramble_image(width, height, url.as_ref())?;
-			let Some((_, base64_data)) = data_url.split_once(',') else {
-				bail!("Unable to get the raw image data")
-			};
-			let bytes: Vec<u8> = general_purpose::STANDARD
-				.decode(base64_data)
-				.map_err(|_| error!("Invalid base64 data given"))?;
-
-			Ok(ImageRef::new(bytes.as_ref()))
+			// Some older/non-scrambled responses still mark the page as protected without
+			// carrying decoding headers. In that case, use the already-decoded response rather
+			// than blocking forever while probing removed JavaScript exports.
+			Ok(response.image)
 		} else if response.code == 404 {
 			// non-scrambled page whose recorded path variant 404'd: like the site's own client,
 			// retry the alternate path segments and use the first that resolves. safe here
@@ -579,7 +647,10 @@ impl PageImageProcessor for Comix {
 			if let Some(original) = response.request.url.as_ref() {
 				for candidate in image_path_fallbacks(original) {
 					let Ok(resp) = Request::get(&candidate)
-						.map(|r| r.header("Referer", &format!("{BASE_URL}/")))
+						.map(|r| {
+							r.header("Accept", "*/*")
+								.header("Referer", &format!("{}/", settings::base_url()))
+						})
 						.and_then(|r| r.send())
 					else {
 						continue;
@@ -602,8 +673,14 @@ impl PageImageProcessor for Comix {
 const GRID_COLS: usize = 5;
 const GRID_ROWS: usize = 5;
 const GRID_TILES: usize = GRID_COLS * GRID_ROWS;
+const ENC_MULTIPLIER: u32 = 1_000_005;
+const ENC_INCREMENT: u32 = 1_234_567_891;
 const LCG_MULTIPLIER: u32 = 1_664_525;
 const LCG_INCREMENT: u32 = 1_013_904_223;
+
+fn is_legacy_scramble_page(index: usize, is_v3: bool) -> bool {
+	!is_v3 && (index + 1).is_multiple_of(4)
+}
 
 fn image_header<'a>(response: &'a ImageResponse, name: &str) -> Option<&'a str> {
 	response
@@ -613,14 +690,37 @@ fn image_header<'a>(response: &'a ImageResponse, name: &str) -> Option<&'a str> 
 		.map(|(_, value)| value.as_str())
 }
 
-fn descramble_v3_grid(response: &ImageResponse) -> Option<ImageRef> {
-	if image_header(response, "x-scramble-grid") != Some("5x5") {
-		return None;
+fn decode_page_image(response: &ImageResponse) -> Option<ImageRef> {
+	let encoded_seed = image_header(response, "x-enc-seed")
+		.and_then(|value| value.parse::<i64>().ok())
+		.unwrap_or(0) as i32;
+	let encoded_length =
+		image_header(response, "x-enc-len").and_then(|value| value.parse::<usize>().ok());
+	let encoded_algorithm = image_header(response, "x-enc-algo");
+	let encoded = encoded_seed != 0 && encoded_length.is_some();
+
+	let mut decoded_image = None;
+	if encoded {
+		let bytes = response.image.data();
+		if bytes.is_empty() {
+			return None;
+		}
+		let decoded = decode_encoded_bytes(
+			bytes,
+			encoded_seed,
+			encoded_length.unwrap_or_default(),
+			encoded_algorithm,
+		);
+		decoded_image = Some(ImageRef::new(&decoded));
 	}
 
+	let should_descramble = image_header(response, "x-scramble-grid") == Some("5x5");
+	if !should_descramble {
+		return decoded_image;
+	}
 	let algorithm = image_header(response, "x-scramble-algo");
 	if !matches!(algorithm, None | Some("1" | "2" | "3")) {
-		return None;
+		return decoded_image;
 	}
 
 	let seed = image_header(response, "x-scramble-seed")?
@@ -641,8 +741,9 @@ fn descramble_v3_grid(response: &ImageResponse) -> Option<ImageRef> {
 		build_lcg_order(mixed_seed, GRID_TILES)
 	};
 
-	let width = response.image.width();
-	let height = response.image.height();
+	let image = decoded_image.as_ref().unwrap_or(&response.image);
+	let width = image.width();
+	let height = image.height();
 	let tile_width = (width as u32 / GRID_COLS as u32) as f32;
 	let tile_height = (height as u32 / GRID_ROWS as u32) as f32;
 	if tile_width == 0.0 || tile_height == 0.0 {
@@ -651,19 +752,73 @@ fn descramble_v3_grid(response: &ImageResponse) -> Option<ImageRef> {
 
 	let mut canvas = Canvas::new(width, height);
 	// Preserve remainder pixels at the right and bottom when dimensions are not divisible by 5.
-	canvas.draw_image(&response.image, Rect::new(0.0, 0.0, width, height));
+	canvas.draw_image(image, Rect::new(0.0, 0.0, width, height));
 	for (destination, source) in order.into_iter().enumerate() {
 		let source_x = (source % GRID_COLS) as f32 * tile_width;
 		let source_y = (source / GRID_COLS) as f32 * tile_height;
 		let destination_x = (destination % GRID_COLS) as f32 * tile_width;
 		let destination_y = (destination / GRID_COLS) as f32 * tile_height;
 		canvas.copy_image(
-			&response.image,
+			image,
 			Rect::new(source_x, source_y, tile_width, tile_height),
 			Rect::new(destination_x, destination_y, tile_width, tile_height),
 		);
 	}
 	Some(canvas.get_image())
+}
+
+fn decode_encoded_bytes(
+	bytes: Vec<u8>,
+	seed: i32,
+	length: usize,
+	algorithm: Option<&str>,
+) -> Vec<u8> {
+	if algorithm != Some("2") {
+		return decode_with_lcg(bytes, seed, length);
+	}
+
+	let candidates = [
+		decode_with_xorshift(bytes.clone(), seed | 1, length, false),
+		decode_with_xorshift(bytes.clone(), seed, length, false),
+		decode_with_xorshift(bytes.clone(), seed | 1, length, true),
+		decode_with_lcg(bytes, seed, length),
+	];
+	candidates
+		.iter()
+		.find(|candidate| has_image_signature(candidate))
+		.cloned()
+		.unwrap_or_else(|| candidates[0].clone())
+}
+
+fn decode_with_xorshift(mut bytes: Vec<u8>, seed: i32, length: usize, high_byte: bool) -> Vec<u8> {
+	let mut state = seed as u32;
+	let limit = bytes.len().min(length);
+	for byte in bytes.iter_mut().take(limit) {
+		state ^= state.wrapping_shl(13);
+		state ^= state.wrapping_shr(17);
+		state ^= state.wrapping_shl(5);
+		let key = if high_byte { state >> 24 } else { state & 0xff };
+		*byte ^= key as u8;
+	}
+	bytes
+}
+
+fn decode_with_lcg(mut bytes: Vec<u8>, seed: i32, length: usize) -> Vec<u8> {
+	let mut state = seed as u32;
+	let limit = bytes.len().min(length);
+	for byte in bytes.iter_mut().take(limit) {
+		state = state
+			.wrapping_mul(ENC_MULTIPLIER)
+			.wrapping_add(ENC_INCREMENT);
+		*byte ^= (state >> 24) as u8;
+	}
+	bytes
+}
+
+fn has_image_signature(bytes: &[u8]) -> bool {
+	bytes.starts_with(&[0xff, 0xd8])
+		|| bytes.starts_with(&[0x89, b'P', b'N', b'G'])
+		|| (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
 }
 
 fn inverse_order(shuffled: Vec<usize>) -> Vec<usize> {
@@ -727,7 +882,10 @@ impl NotificationHandler for Comix {
 
 impl DeepLinkHandler for Comix {
 	fn handle_deep_link(&self, url: String) -> Result<Option<DeepLinkResult>> {
-		let Some(path) = url.strip_prefix(&format!("{BASE_URL}/")) else {
+		let Some(path) = ["https://comix.to/", "https://comix.ws/"]
+			.into_iter()
+			.find_map(|base| url.strip_prefix(base))
+		else {
 			return Ok(None);
 		};
 
@@ -758,27 +916,6 @@ impl DeepLinkHandler for Comix {
 	}
 }
 
-const VERIFY_COOKIE_KEY: &str = "waf_pass";
-
-impl WebLoginHandler for Comix {
-	fn handle_web_login(&self, key: String, cookies: HashMap<String, String>) -> Result<bool> {
-		if key == "verify" {
-			// This is the verification button, not the actual login button.
-			// We need to intercept waf_pass cookie so that we can pass the checks.
-			// This will not log you in even if you do the login page afterward.
-			return Ok(cookies.get(VERIFY_COOKIE_KEY).is_some_and(|pass| {
-				let Some((timestamp, _)) = pass.split_once('.') else {
-					return false;
-				};
-				let current_timestamp = current_date();
-				current_timestamp - timestamp.parse::<i64>().unwrap_or(0) < 30 * 60
-			}));
-		}
-
-		Ok(false)
-	}
-}
-
 register_source!(
 	Comix,
 	Home,
@@ -786,8 +923,7 @@ register_source!(
 	ImageRequestProvider,
 	PageImageProcessor,
 	NotificationHandler,
-	DeepLinkHandler,
-	WebLoginHandler
+	DeepLinkHandler
 );
 
 #[cfg(test)]
@@ -815,5 +951,30 @@ mod tests {
 				23, 15,
 			]
 		);
+	}
+
+	#[aidoku_test]
+	fn decodes_lcg_page_prefix() {
+		let original = b"\xff\xd8comix-image-data".to_vec();
+		let encoded = decode_with_lcg(original.clone(), 123_456, original.len());
+		assert_eq!(decode_with_lcg(encoded, 123_456, original.len()), original);
+	}
+
+	#[aidoku_test]
+	fn decodes_xorshift_page_prefix() {
+		let original = b"RIFFxxxxWEBPcomix-image-data".to_vec();
+		let encoded = decode_with_xorshift(original.clone(), 123_457, original.len(), false);
+		assert_eq!(
+			decode_with_xorshift(encoded, 123_457, original.len(), false),
+			original
+		);
+	}
+
+	#[aidoku_test]
+	fn marks_only_legacy_fourth_pages() {
+		assert!(!is_legacy_scramble_page(2, false));
+		assert!(is_legacy_scramble_page(3, false));
+		assert!(!is_legacy_scramble_page(3, true));
+		assert!(is_legacy_scramble_page(7, false));
 	}
 }

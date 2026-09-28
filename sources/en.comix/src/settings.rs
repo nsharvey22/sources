@@ -1,9 +1,11 @@
-use crate::VERIFY_COOKIE_KEY;
 use aidoku::{
-	alloc::{string::String, vec::Vec},
-	imports::defaults::{DefaultValue, defaults_get, defaults_get_map, defaults_set},
+	alloc::{format, string::String, vec::Vec},
+	imports::defaults::{DefaultValue, defaults_get, defaults_set},
 };
 
+const BASE_URL_KEY: &str = "baseUrl";
+const DEFAULT_BASE_URL: &str = "https://comix.to";
+const MIRROR_BASE_URL: &str = "https://comix.ws";
 const HIDE_NSFW_KEY: &str = "hideNSFW";
 const THUMBNAIL_QUALITY_KEY: &str = "thumbnailQuality";
 const DEDUPED_CHAPTER_KEY: &str = "dedupedChapter";
@@ -12,7 +14,16 @@ const HIDDEN_TYPES_KEY: &str = "hiddenTypes";
 const HIDDEN_GENRES_KEY: &str = "hiddenGenres";
 const HIDDEN_THEMES_KEY: &str = "hiddenThemes";
 
-const VERIFY_KEY: &str = "verify";
+pub fn base_url() -> String {
+	match defaults_get::<String>(BASE_URL_KEY).as_deref() {
+		Some(MIRROR_BASE_URL) => MIRROR_BASE_URL.into(),
+		_ => DEFAULT_BASE_URL.into(),
+	}
+}
+
+pub fn api_url() -> String {
+	format!("{}/api/v1", base_url())
+}
 
 pub fn hide_nsfw() -> bool {
 	defaults_get::<bool>(HIDE_NSFW_KEY).unwrap_or(true)
@@ -54,10 +65,4 @@ pub fn reset_filters() {
 	defaults_set(HIDDEN_TYPES_KEY, DefaultValue::Null);
 	defaults_set(HIDDEN_GENRES_KEY, DefaultValue::Null);
 	defaults_set(HIDDEN_THEMES_KEY, DefaultValue::Null);
-}
-
-pub fn get_verify_cookie() -> Option<String> {
-	defaults_get_map(VERIFY_KEY)?
-		.get(VERIFY_COOKIE_KEY)
-		.cloned()
 }

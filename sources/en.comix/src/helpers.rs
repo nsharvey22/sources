@@ -1,4 +1,4 @@
-use crate::{VERIFY_COOKIE_KEY, models::ComixChapter, settings::get_verify_cookie};
+use crate::{models::ComixChapter, settings};
 use aidoku::{
 	HashMap, Result,
 	alloc::{
@@ -10,11 +10,11 @@ use aidoku::{
 };
 
 pub fn create_request_get(url: &str) -> Result<Request> {
-	let mut request = Request::get(url)?;
-	if let Some(token) = get_verify_cookie() {
-		request = request.header("Cookie", &format!("{VERIFY_COOKIE_KEY}={token}"));
-	}
-	Ok(request)
+	let base_url = settings::base_url();
+	Ok(Request::get(url)?
+		.header("Accept", "*/*")
+		.header("Referer", &format!("{base_url}/"))
+		.header("Origin", &base_url))
 }
 
 fn is_official_like(ch: &ComixChapter) -> bool {
