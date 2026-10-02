@@ -7,7 +7,7 @@ use crate::{
 use aidoku::{
 	HashMap, Result,
 	alloc::{string::String, string::ToString, vec::Vec},
-	helpers::uri::QueryParameters,
+	helpers::uri::{QueryParameters, decode_uri},
 	imports::{
 		js::WebView,
 		net::{Request, Response},
@@ -55,33 +55,145 @@ const FETCH_TIMEOUT_RESPONSE: &str =
 const JS_PATCHER: &str = "<head>\
 <script>window['__AIDOKU_CANVAS_TO_DATA_URL_TOKEN__'] = HTMLCanvasElement.prototype.toDataURL;</script>";
 
-const HTML_CAPTURE_PATCH: &str = r#"<head><script>
+const HTML_CAPTURE_SCRIPT: &str = r#"
 (() => {
 	window.__aidokuBrowsePayload = '';
+	window.__aidokuPendingEmptyBrowsePayload = '';
+	window.__aidokuEmptyBrowseObservedAt = 0;
 	window.__aidokuPagePayload = '';
 	window.__aidokuCaptureError = '';
-	const capture = parsed => {
+	const expectedKeyword = (() => {
 		try {
-			const result = parsed && parsed.result;
+			const params = new URL(window.location.href).searchParams;
+			return params.get('keyword') || params.get('q') || '';
+		} catch (_) {
+			return '';
+		}
+	})();
+	const capture = (parsed, allowEmpty = false) => {
+		try {
+			const directBrowseResult = parsed && Array.isArray(parsed.items);
+			const result = directBrowseResult ? parsed : parsed && parsed.result;
 			if (
 				result && Array.isArray(result.items) &&
-				result.items.some(item => item && typeof item.hid === 'string')
+				(allowEmpty || result.items.some(item => item && typeof item.hid === 'string'))
 			) {
-				window.__aidokuBrowsePayload = JSON.stringify(parsed);
+				const payload = JSON.stringify(
+					directBrowseResult ? { result: parsed } : parsed
+				);
+				if (result.items.length === 0) {
+					window.__aidokuPendingEmptyBrowsePayload = payload;
+					return false;
+				}
+				window.__aidokuBrowsePayload = payload;
+				return true;
 			}
-			if (result && result.pages && Array.isArray(result.pages.items)) {
+			const pageResult = parsed && parsed.result;
+			if (pageResult && pageResult.pages && Array.isArray(pageResult.pages.items)) {
 				window.__aidokuPagePayload = JSON.stringify(parsed);
+				return true;
 			}
 		} catch (_) {}
+		return false;
 	};
-	const captureText = text => {
-		try { if (text) capture(JSON.parse(text)); } catch (_) {}
+	const captureText = (text, allowEmpty = false) => {
+		try { if (text) capture(JSON.parse(text), allowEmpty); } catch (_) {}
 	};
+	const shouldCaptureBrowseUrl = rawUrl => {
+		try {
+			const url = new URL(rawUrl || '', window.location.origin);
+			if (!url.pathname.includes('/api/v1/manga')) return false;
+			if (!expectedKeyword) return true;
+			return url.searchParams.get('keyword') === expectedKeyword;
+		} catch (_) {
+			return false;
+		}
+	};
+	try {
+		const raw = document.querySelector('script#initial-data')?.textContent;
+		const queries = raw && JSON.parse(raw).queries;
+		if (queries) Object.values(queries).some(value => capture(value));
+	} catch (_) {}
+	const captureRenderedBrowse = () => {
+		try {
+			const rows = Array.from(document.querySelectorAll('.lrow'));
+			if (rows.length === 0) {
+				const isEmpty = Array.from(document.querySelectorAll('p')).some(element =>
+					element.textContent?.includes('No comics match your filters')
+				);
+				if (!isEmpty) return false;
+				if (!window.__aidokuEmptyBrowseObservedAt) {
+					window.__aidokuEmptyBrowseObservedAt = Date.now();
+					return false;
+				}
+				if (Date.now() - window.__aidokuEmptyBrowseObservedAt < 5000) return false;
+				const page = Number.parseInt(
+					new URL(window.location.href).searchParams.get('page') || '1',
+					10
+				) || 1;
+				window.__aidokuBrowsePayload = window.__aidokuPendingEmptyBrowsePayload
+					|| JSON.stringify({ result: { items: [], meta: { page, lastPage: page } } });
+				return true;
+			}
+			window.__aidokuEmptyBrowseObservedAt = 0;
+			const items = rows.map(row => {
+				const link = row.querySelector('a[href*="/title/"]');
+				const url = link && link.getAttribute('href') || '';
+				const slug = url.split('/title/')[1] || '';
+				const hid = slug.split('-')[0];
+				const title = row.querySelector('.lrow__title')?.textContent?.trim()
+					|| link?.getAttribute('aria-label') || '';
+				const image = row.querySelector('img')?.src || '';
+				const chapterText = row.querySelector('.lrow__ch')?.textContent || '';
+				const chapter = Number.parseFloat(chapterText.replace(/[^0-9.]/g, ''));
+				return {
+					hid,
+					title,
+					synopsis: row.querySelector('.lrow__desc')?.textContent?.trim() || null,
+					type: row.querySelector('.lrow__type')?.textContent?.trim().toLowerCase() || 'other',
+					poster: image ? { medium: image, large: image } : null,
+					status: row.querySelector('.lrow__status')?.textContent?.trim()
+						.toLowerCase().replaceAll(' ', '_') || 'unknown',
+					contentRating: 'unknown',
+					authors: null,
+					artists: null,
+					genres: null,
+					tags: null,
+					latestChapter: Number.isFinite(chapter) ? chapter : null,
+					url
+				};
+			}).filter(item => item.hid && item.title && item.url);
+			if (items.length === 0) return false;
+			const page = Number.parseInt(
+				new URL(window.location.href).searchParams.get('page') || '1',
+				10
+			) || 1;
+			window.__aidokuBrowsePayload = JSON.stringify({
+				result: {
+					items,
+					meta: { page, lastPage: items.length >= 28 ? page + 1 : page }
+				}
+			});
+			return true;
+		} catch (_) {
+			return false;
+		}
+	};
+	window.__aidokuCaptureRenderedBrowse = captureRenderedBrowse;
+	const renderedBrowseTimer = setInterval(() => {
+		if (window.__aidokuBrowsePayload || captureRenderedBrowse()) {
+			clearInterval(renderedBrowseTimer);
+		}
+	}, 250);
 	const originalFetch = window.fetch;
 	if (typeof originalFetch === 'function') {
 		window.fetch = function () {
 			return originalFetch.apply(this, arguments).then(response => {
-				try { response.clone().text().then(captureText).catch(() => {}); } catch (_) {}
+				try {
+					if (shouldCaptureBrowseUrl(response && response.url)) {
+						response.clone().text().then(text => captureText(text, true)).catch(() => {});
+					}
+				} catch (_) {}
 				return response;
 			});
 		};
@@ -94,7 +206,11 @@ const HTML_CAPTURE_PATCH: &str = r#"<head><script>
 	};
 	XMLHttpRequest.prototype.send = function () {
 		this.addEventListener('load', function () {
-			try { captureText(this.responseText); } catch (_) {}
+			try {
+				if (shouldCaptureBrowseUrl(this.__aidokuCaptureUrl)) {
+					captureText(this.responseText, true);
+				}
+			} catch (_) {}
 		});
 		return originalSend.apply(this, arguments);
 	};
@@ -102,15 +218,16 @@ const HTML_CAPTURE_PATCH: &str = r#"<head><script>
 	JSON.parse = new Proxy(originalParse, {
 		apply(target, thisArg, args) {
 			const parsed = Reflect.apply(target, thisArg, args);
-			capture(parsed);
+			if (!expectedKeyword) capture(parsed);
 			return parsed;
 		}
 	});
 	setTimeout(() => {
 		window.__aidokuCaptureError = 'Timed out waiting for Comix page data';
 	}, 30000);
+	return '';
 })();
-</script>"#;
+"#;
 
 const CHAPTER_CAPTURE_JS: &str = r#"(() => {
 	window.__aidokuChapterPayload = '';
@@ -256,20 +373,104 @@ impl ComixWebView {
 		serde_json::from_str(data).map_err(|e| error!("Invalid initial page data: {e}"))
 	}
 
-	fn capture_webview(url: &str, html: String) -> Result<WebView> {
-		let patched = if html.contains("<head>") {
-			html.replacen("<head>", HTML_CAPTURE_PATCH, 1)
-		} else {
-			format!("{HTML_CAPTURE_PATCH}{html}")
-		};
+	fn capture_webview(url: &str) -> Result<WebView> {
 		let web_view = WebView::new();
-		web_view.load_html_blocking(&patched, Some(url))?;
+		web_view.load_blocking(Request::get(url)?)?;
+		web_view.eval(HTML_CAPTURE_SCRIPT)?;
 		Ok(web_view)
+	}
+
+	fn browse_url(url: &str) -> String {
+		let Some((base, query)) = url.split_once('?') else {
+			return url.to_string();
+		};
+		let mut output = QueryParameters::new();
+		let mut sort = None;
+		let mut types = Vec::new();
+		let mut statuses = Vec::new();
+		let mut genres_in = Vec::new();
+		let mut genres_ex = Vec::new();
+		let mut demographics = Vec::new();
+		let mut authors = Vec::new();
+		let mut artists = Vec::new();
+
+		for parameter in query.split('&') {
+			let (raw_name, raw_value) = parameter.split_once('=').unwrap_or((parameter, ""));
+			let name = decode_uri(raw_name);
+			let value = decode_uri(raw_value);
+			match name.as_str() {
+				"keyword" | "q" => output.push("q", Some(&value)),
+				"page" | "genres_mode" => output.push(&name, Some(&value)),
+				"types[]" | "types" => types.extend(value.split(',').map(String::from)),
+				"statuses[]" | "statuses" => statuses.extend(value.split(',').map(String::from)),
+				"genres_in[]" | "genres_in" => {
+					genres_in.extend(value.split(',').map(String::from));
+				}
+				"genres_ex[]" | "genres_ex" => {
+					genres_ex.extend(
+						value
+							.split(',')
+							.filter(|id| {
+								!matches!(*id, "87264" | "8" | "87265" | "13" | "87266" | "87268")
+							})
+							.map(String::from),
+					);
+				}
+				"demographics[]" | "demos" => {
+					demographics.extend(
+						value
+							.split(',')
+							.filter(|id| !id.starts_with('-'))
+							.map(String::from),
+					);
+				}
+				"authors[]" | "authors" => authors.extend(value.split(',').map(String::from)),
+				"artists[]" | "artists" => artists.extend(value.split(',').map(String::from)),
+				_ if name.starts_with("order[") && name.ends_with(']') => {
+					sort = Some(format!("{}:{value}", &name[6..name.len() - 1]));
+				}
+				_ => {}
+			}
+		}
+
+		if let Some(sort) = sort {
+			output.push("sort", Some(&sort));
+		}
+		for (name, values) in [
+			("types", types),
+			("statuses", statuses),
+			("genres_in", genres_in),
+			("genres_ex", genres_ex),
+			("demos", demographics),
+			("authors", authors),
+			("artists", artists),
+		] {
+			if !values.is_empty() {
+				output.push(name, Some(&values.join(",")));
+			}
+		}
+
+		if output.is_empty() {
+			base.to_string()
+		} else {
+			format!("{base}?{output}")
+		}
+	}
+
+	fn decode_search_value(mut value: Value) -> Result<SearchResponse> {
+		if value.get("result").is_none() && value.get("items").and_then(Value::as_array).is_some() {
+			let mut wrapped = serde_json::Map::new();
+			wrapped.insert("result".to_string(), value);
+			value = Value::Object(wrapped);
+		}
+		serde_json::from_value(value).map_err(|e| error!("Invalid browse data: {e}"))
 	}
 
 	fn wait_for_payload(web_view: &WebView, payload_key: &str, error_key: &str) -> Result<String> {
 		loop {
-			let payload = web_view.eval(&format!("(() => window[{payload_key:?}] || '')()"))?;
+			let payload = web_view.eval(&format!(
+				"(() => {{ window.__aidokuCaptureRenderedBrowse?.(); return window[{payload_key:?}] || ''; }})()"
+			))?;
 			if !payload.is_empty() {
 				return Ok(payload);
 			}
@@ -281,11 +482,28 @@ impl ComixWebView {
 	}
 
 	pub fn fetch_browse(&self, url: &str) -> Result<SearchResponse> {
-		let html = Self::get_html(url)?;
-		let web_view = Self::capture_webview(url, html)?;
+		let url = Self::browse_url(url);
+		let html = Self::get_html(&url)?;
+		if let Ok(initial_data) = Self::initial_data(&html)
+			&& let Some(response) = initial_data
+				.get("queries")
+				.and_then(Value::as_object)
+				.and_then(|queries| {
+					queries.values().find_map(|value| {
+						Self::decode_search_value(value.clone())
+							.ok()
+							.filter(|response| !response.result.items.is_empty())
+					})
+				}) {
+			return Ok(response);
+		}
+		let web_view = Self::capture_webview(&url)?;
 		let payload =
 			Self::wait_for_payload(&web_view, "__aidokuBrowsePayload", "__aidokuCaptureError")?;
-		serde_json::from_str(&payload).map_err(|e| error!("Invalid browse data: {e}"))
+		let value =
+			serde_json::from_str(&payload).map_err(|e| error!("Invalid browse data: {e}"))?;
+		let response = Self::decode_search_value(value)?;
+		Ok(response)
 	}
 
 	pub fn fetch_manga(&self, url: &str) -> Result<ComixManga> {
@@ -306,8 +524,8 @@ impl ComixWebView {
 	}
 
 	pub fn fetch_chapters(&self, url: &str, manga_id: &str) -> Result<Vec<ComixChapter>> {
-		let html = Self::get_html(url)?;
-		let web_view = Self::capture_webview(url, html)?;
+		Self::get_html(url)?;
+		let web_view = Self::capture_webview(url)?;
 		let manga_id = serde_json::to_string(manga_id)
 			.map_err(|e| error!("Failed to encode manga id: {e}"))?;
 		web_view.eval(&CHAPTER_CAPTURE_JS.replace("__AIDOKU_MANGA_ID__", &manga_id))?;
@@ -317,8 +535,8 @@ impl ComixWebView {
 	}
 
 	pub fn fetch_pages(&self, url: &str) -> Result<ChapterResponse> {
-		let html = Self::get_html(url)?;
-		let web_view = Self::capture_webview(url, html)?;
+		Self::get_html(url)?;
+		let web_view = Self::capture_webview(url)?;
 		let payload =
 			Self::wait_for_payload(&web_view, "__aidokuPagePayload", "__aidokuCaptureError")?;
 		serde_json::from_str(&payload).map_err(|e| error!("Invalid page data: {e}"))
@@ -872,5 +1090,29 @@ mod tests {
 		assert!(!ComixWebView::is_cloudflare_block(
 			"<title>Comix - Read Comics online for free</title><p>Sorry, you have been blocked</p>"
 		));
+	}
+
+	#[aidoku_test]
+	fn decodes_direct_browse_payload() {
+		let value =
+			serde_json::from_str(r#"{"items":[],"pagination":{"page":1,"last_page":2}}"#).unwrap();
+		let response = ComixWebView::decode_search_value(value).unwrap();
+		let result: aidoku::MangaPageResult = response.into();
+		assert!(result.entries.is_empty());
+		assert!(result.has_next_page);
+	}
+
+	#[aidoku_test]
+	fn converts_api_query_to_current_browse_query() {
+		let url = ComixWebView::browse_url(
+			"https://comix.to/browse?order%5Bviews_7d%5D=desc&page=2\
+			&types%5B%5D=manga&types%5B%5D=manhwa&keyword=magic%20girl\
+			&genres_ex%5B%5D=87264&genres_ex%5B%5D=6",
+		);
+		assert_eq!(
+			url,
+			"https://comix.to/browse?page=2&q=magic%20girl&sort=views_7d%3Adesc\
+			&types=manga%2Cmanhwa&genres_ex=6"
+		);
 	}
 }

@@ -28,6 +28,7 @@ where
 			serde_json::from_value(items.clone()).map_err(serde::de::Error::custom)?;
 		let meta = value
 			.get("meta")
+			.or_else(|| value.get("pagination"))
 			.map(|m| serde_json::from_value(m.clone()).map_err(serde::de::Error::custom))
 			.transpose()?;
 		Ok(MangaItems { items, meta })
@@ -71,8 +72,16 @@ pub struct TagSearchResponse {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Pagination {
+	#[serde(default = "default_page")]
 	pub page: i32,
+	#[serde(default = "default_page", alias = "last_page")]
 	pub last_page: i32,
+	#[serde(default)]
+	pub has_next: Option<bool>,
+}
+
+const fn default_page() -> i32 {
+	1
 }
 
 #[derive(Deserialize)]
@@ -90,7 +99,10 @@ impl MangaItems {
 				.filter(|m| !m.is_hidden(content_types, hidden_terms))
 				.map(Into::into)
 				.collect(),
-			has_next_page: self.meta.map(|p| p.page < p.last_page).unwrap_or_default(),
+			has_next_page: self
+				.meta
+				.map(|p| p.has_next.unwrap_or(p.page < p.last_page))
+				.unwrap_or_default(),
 		}
 	}
 }
@@ -99,7 +111,10 @@ impl From<MangaItems> for MangaPageResult {
 	fn from(value: MangaItems) -> Self {
 		MangaPageResult {
 			entries: value.items.into_iter().map(Into::into).collect(),
-			has_next_page: value.meta.map(|p| p.page < p.last_page).unwrap_or_default(),
+			has_next_page: value
+				.meta
+				.map(|p| p.has_next.unwrap_or(p.page < p.last_page))
+				.unwrap_or_default(),
 		}
 	}
 }
