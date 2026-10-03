@@ -14,6 +14,7 @@ use aidoku::{
 	},
 	prelude::*,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use regex::Regex;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -540,6 +541,35 @@ impl ComixWebView {
 		let payload =
 			Self::wait_for_payload(&web_view, "__aidokuPagePayload", "__aidokuCaptureError")?;
 		serde_json::from_str(&payload).map_err(|e| error!("Invalid page data: {e}"))
+	}
+
+	/// Loads a CDN image through WebKit and returns the rendered pixels as PNG data.
+	///
+	/// Comix's current image CDN rejects CFNetwork/URLSession requests while accepting the
+	/// same URL as a browser image navigation. Loading the image as the top-level WebView
+	/// document also keeps the canvas same-origin, so its pixels can be read without CORS.
+	pub fn fetch_image(url: &str) -> Result<Vec<u8>> {
+		let web_view = WebView::new();
+		web_view.load_blocking(Request::get(url)?)?;
+		let data_url = web_view.eval(
+			r#"(() => {
+				const image = document.images && document.images[0];
+				if (!image || !image.complete || !image.naturalWidth || !image.naturalHeight) {
+					return '';
+				}
+				const canvas = document.createElement('canvas');
+				canvas.width = image.naturalWidth;
+				canvas.height = image.naturalHeight;
+				canvas.getContext('2d').drawImage(image, 0, 0);
+				return canvas.toDataURL('image/png');
+			})()"#,
+		)?;
+		let encoded = data_url
+			.strip_prefix("data:image/png;base64,")
+			.ok_or(error!("WebView did not load the Comix image"))?;
+		STANDARD
+			.decode(encoded)
+			.map_err(|_| error!("Failed to decode WebView image"))
 	}
 
 	pub fn has_signer(&self) -> bool {

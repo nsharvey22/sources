@@ -1,14 +1,14 @@
 #![no_std]
 use aidoku::{
 	Chapter, DeepLinkHandler, DeepLinkResult, FilterValue, HashMap, Home, HomeComponent,
-	HomeLayout, HomePartialResult, ImageRequestProvider, ImageResponse, Link, LinkValue, Listing,
-	ListingProvider, Manga, MangaPageResult, MangaWithChapter, NotificationHandler, Page,
-	PageContent, PageContext, PageImageProcessor, Result, Source,
+	HomeLayout, HomePartialResult, ImageRequest, ImageRequestProvider, ImageResponse, Link,
+	LinkValue, Listing, ListingProvider, Manga, MangaPageResult, MangaWithChapter,
+	NotificationHandler, Page, PageContent, PageContext, PageImageProcessor, Result, Source,
 	alloc::{String, Vec, string::ToString, vec},
 	helpers::uri::{QueryParameters, encode_uri_component},
 	imports::{
 		canvas::{Canvas, ImageRef, Rect},
-		net::Request,
+		net::{Request, Response},
 		std::send_partial_result,
 	},
 	prelude::*,
@@ -351,24 +351,21 @@ impl Source for Comix {
 					url.push(if url.contains('?') { '&' } else { '?' });
 					url.push_str("v3");
 				}
-				// Current legacy pages encrypt every fourth image. They do not advertise this in
-				// the page DTO; the Origin header causes the CDN to return x-enc-* metadata.
+				// Older chapter payloads may still mark every fourth image for the legacy
+				// descrambler. Keep that context so encrypted cached responses remain decodable.
 				let is_legacy_scramble = is_legacy_scramble_page(index, is_v3);
+				let mut context = PageContext::new();
+				context.insert("image_url".into(), url.clone());
+				if is_v3 {
+					context.insert("s".into(), "1".into());
+				}
+				if is_legacy_scramble {
+					context.insert("legacy_scramble".into(), "1".into());
+				}
+				context.insert("width".into(), page.width.to_string());
+				context.insert("height".into(), page.height.to_string());
 				Page {
-					content: if is_v3 || page.s.is_some() || is_legacy_scramble {
-						let mut context = PageContext::new();
-						if is_v3 {
-							context.insert("s".into(), "1".into());
-						}
-						if is_legacy_scramble {
-							context.insert("legacy_scramble".into(), "1".into());
-						}
-						context.insert("width".into(), page.width.to_string());
-						context.insert("height".into(), page.height.to_string());
-						PageContent::url_context(url, context)
-					} else {
-						PageContent::url(url)
-					},
+					content: PageContent::url_context(url, context),
 					..Default::default()
 				}
 			})
@@ -594,18 +591,8 @@ impl ListingProvider for Comix {
 }
 
 impl ImageRequestProvider for Comix {
-	fn get_image_request(&self, url: String, context: Option<PageContext>) -> Result<Request> {
-		let mut request = Request::get(&url)?
-			.header("Accept", "*/*")
-			.header("Referer", &format!("{}/", settings::base_url()));
-		if context.as_ref().is_some_and(|context| {
-			context
-				.get("legacy_scramble")
-				.is_some_and(|value| value == "1")
-		}) {
-			request = request.header("Origin", &settings::base_url());
-		}
-		Ok(request)
+	fn get_image_request(&self, url: String, _context: Option<PageContext>) -> Result<Request> {
+		page_image_request(&url)
 	}
 }
 
@@ -615,60 +602,110 @@ impl PageImageProcessor for Comix {
 		response: ImageResponse,
 		context: Option<PageContext>,
 	) -> Result<ImageRef> {
-		if response.code >= 400 {
-			bail!(
-				"Comix's image CDN was blocked on this network. Try the other Website Domain in Source Settings, switch to cellular data, or use a VPN, then reload the chapter."
-			)
-		}
-
 		let is_scrambled = context.as_ref().is_some_and(|context| {
 			context.get("s").is_some_and(|value| value == "1")
 				|| context
 					.get("legacy_scramble")
 					.is_some_and(|value| value == "1")
 		});
+		let original_url = response.request.url.clone().or_else(|| {
+			context
+				.as_ref()
+				.and_then(|context| context.get("image_url"))
+				.cloned()
+		});
 
-		// Current pages use native x-enc-* byte encryption, x-scramble-* tile scrambling, or
-		// both. The site's secure module no longer reliably exports a legacy descrambler, so
-		// decode the response metadata directly, matching the current web client behavior.
-		if is_scrambled {
-			if let Some(image) = decode_page_image(&response) {
-				return Ok(image);
-			}
+		if response.code < 400 {
+			return Ok(finalize_page_image(response, is_scrambled));
+		}
 
-			// Some older/non-scrambled responses still mark the page as protected without
-			// carrying decoding headers. In that case, use the already-decoded response rather
-			// than blocking forever while probing removed JavaScript exports.
-			Ok(response.image)
-		} else if response.code == 404 {
-			// non-scrambled page whose recorded path variant 404'd: like the site's own client,
-			// retry the alternate path segments and use the first that resolves. safe here
-			// because we return the fetched bytes directly (no path-specific descrambling).
-			if let Some(original) = response.request.url.as_ref() {
-				for candidate in image_path_fallbacks(original) {
-					let Ok(resp) = Request::get(&candidate)
-						.map(|r| {
-							r.header("Accept", "*/*")
-								.header("Referer", &format!("{}/", settings::base_url()))
-						})
-						.and_then(|r| r.send())
-					else {
-						continue;
-					};
-					if resp.status_code() != 404 {
-						if let Ok(image) = resp.get_image() {
-							return Ok(image);
-						}
-						break;
-					}
+		// Comix rotates image path variants independently of the chapter payload. Only probe
+		// alternate variants for a missing image. A Cloudflare 403 applies to every variant;
+		// retrying it only creates a request storm and leaves the reader spinning.
+		if response.code == 404
+			&& let Some(original) = original_url.as_ref()
+		{
+			for candidate in image_path_fallbacks(original) {
+				let Ok(retry) = page_image_request(&candidate).and_then(|r| Ok(r.send()?)) else {
+					continue;
+				};
+				if let Some(image) = image_from_response(retry, &candidate, is_scrambled) {
+					return Ok(image);
 				}
 			}
-			Ok(response.image)
-		} else {
-			Ok(response.image)
 		}
+
+		// The current CDN can reject URLSession while accepting a real browser image request.
+		// Mirror the website by loading the same URL in WebKit, then return its rendered pixels.
+		if let Some(url) = original_url.as_ref() {
+			let data = ComixWebView::fetch_image(url)?;
+			return Ok(ImageRef::new(&data));
+		}
+
+		bail!(
+			"Comix's image CDN was blocked on this network. Try the other Website Domain in Source Settings, switch to cellular data, or use a VPN, then reload the chapter."
+		)
 	}
 }
+
+const IMAGE_RESPONSE_HEADERS: &[&str] = &[
+	"x-enc-seed",
+	"x-enc-len",
+	"x-enc-algo",
+	"x-scramble-grid",
+	"x-scramble-algo",
+	"x-scramble-seed",
+	"x-scramble-hash",
+];
+
+fn page_image_request(url: &str) -> Result<Request> {
+	// Match the website's referrer-policy="no-referrer" image requests. The CDN can still
+	// reject CFNetwork clients, which process_page_image handles with its WebKit fallback.
+	Ok(Request::get(url)?
+		.header("Accept", "*/*")
+		.header("User-Agent", IMAGE_USER_AGENT))
+}
+
+fn finalize_page_image(response: ImageResponse, is_scrambled: bool) -> ImageRef {
+	if is_scrambled {
+		decode_page_image(&response).unwrap_or(response.image)
+	} else {
+		response.image
+	}
+}
+
+fn image_from_response(response: Response, url: &str, is_scrambled: bool) -> Option<ImageRef> {
+	let code = response.status_code();
+	if !(200..400).contains(&code) {
+		return None;
+	}
+	let image = response.get_image().ok()?;
+	if !is_scrambled {
+		return Some(image);
+	}
+
+	let mut headers = HashMap::new();
+	for &name in IMAGE_RESPONSE_HEADERS {
+		if let Some(value) = response.get_header(name) {
+			headers.insert(name.to_string(), value);
+		}
+	}
+	Some(finalize_page_image(
+		ImageResponse {
+			code: code as u16,
+			headers,
+			request: ImageRequest {
+				url: Some(url.to_string()),
+				headers: HashMap::new(),
+			},
+			image,
+		},
+		true,
+	))
+}
+
+const IMAGE_USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) \
+	AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1";
 
 const GRID_COLS: usize = 5;
 const GRID_ROWS: usize = 5;
@@ -855,12 +892,10 @@ fn build_lcg_order(seed: i32, count: usize) -> Vec<usize> {
 	inverse_order(shuffled)
 }
 
-/// Alternate CDN path segments for page images; the site's own client retries these when
-/// the recorded variant returns a 404.
-const IMAGE_PATH_SEGMENTS: &[&str] = &["/i5/", "/si/", "/i/", "/sii/", "/ii/"];
+/// Alternate CDN path segments used by current and older Comix chapter payloads.
+const IMAGE_PATH_SEGMENTS: &[&str] = &["/fcf/", "/i5/", "/si/", "/i/", "/sii/", "/ii/", "/hi/"];
 
-/// Returns fallback URLs for an image URL whose path variant 404'd, swapping the
-/// `/i5/`-style segment for each alternative.
+/// Returns fallback URLs by swapping the image path segment for each alternative.
 fn image_path_fallbacks(url: &str) -> Vec<String> {
 	let Some(current) = IMAGE_PATH_SEGMENTS.iter().find(|s| url.contains(**s)) else {
 		return Vec::new();
@@ -976,5 +1011,16 @@ mod tests {
 		assert!(is_legacy_scramble_page(3, false));
 		assert!(!is_legacy_scramble_page(3, true));
 		assert!(is_legacy_scramble_page(7, false));
+	}
+
+	#[aidoku_test]
+	fn retries_new_hi_image_paths() {
+		let fallbacks = image_path_fallbacks("https://cdn.example/hi/page.webp?r=2");
+		assert_eq!(
+			fallbacks.first().map(String::as_str),
+			Some("https://cdn.example/fcf/page.webp?r=2")
+		);
+		assert!(fallbacks.contains(&"https://cdn.example/i5/page.webp?r=2".into()));
+		assert!(!fallbacks.iter().any(|url| url.contains("/hi/")));
 	}
 }
