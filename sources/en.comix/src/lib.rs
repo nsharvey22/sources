@@ -592,7 +592,10 @@ impl ListingProvider for Comix {
 
 impl ImageRequestProvider for Comix {
 	fn get_image_request(&self, url: String, _context: Option<PageContext>) -> Result<Request> {
-		page_image_request(&url)
+		// Comix's image hosts reject requests carrying the site's Origin or Referer.
+		// Keep ordinary cover and page requests headerless, matching the website's
+		// referrer-policy="no-referrer" behavior.
+		Ok(Request::get(&url)?)
 	}
 }
 
