@@ -594,7 +594,13 @@ impl ImageRequestProvider for Comix {
 	fn get_image_request(&self, url: String, _context: Option<PageContext>) -> Result<Request> {
 		// Comix's image hosts reject requests carrying the site's Origin or Referer.
 		// Keep ordinary cover and page requests headerless, matching the website's
-		// referrer-policy="no-referrer" behavior.
+		// referrer-policy="no-referrer" behavior. A cache-busting query also avoids
+		// intermittently stale CDN responses that otherwise leave covers blank.
+		let url = if url.starts_with("http") {
+			image_retry_url(&url, 1)
+		} else {
+			url
+		};
 		Ok(Request::get(&url)?)
 	}
 }
@@ -611,28 +617,27 @@ impl PageImageProcessor for Comix {
 					.get("legacy_scramble")
 					.is_some_and(|value| value == "1")
 		});
-		let original_url = response.request.url.clone().or_else(|| {
-			context
-				.as_ref()
-				.and_then(|context| context.get("image_url"))
-				.cloned()
-		});
+		let original_url = context
+			.as_ref()
+			.and_then(|context| context.get("image_url"))
+			.cloned()
+			.or_else(|| response.request.url.clone());
 
 		if response.code < 400 {
 			return Ok(finalize_page_image(response, is_scrambled));
 		}
 
-		// Comix rotates image path variants independently of the chapter payload. Only probe
-		// alternate variants for a missing image. A Cloudflare 403 applies to every variant;
-		// retrying it only creates a request storm and leaves the reader spinning.
-		if response.code == 404
+		// The CDN can temporarily return 404/5xx for a valid image. Retry with a changing
+		// query before cycling its path variants, with /hi/ first to match the current site.
+		// Do not retry 403: Cloudflare applies it to every variant on the current network.
+		if is_retryable_image_status(response.code)
 			&& let Some(original) = original_url.as_ref()
 		{
+			if let Some(image) = retry_page_image(original, is_scrambled, 2) {
+				return Ok(image);
+			}
 			for candidate in image_path_fallbacks(original) {
-				let Ok(retry) = page_image_request(&candidate).and_then(|r| Ok(r.send()?)) else {
-					continue;
-				};
-				if let Some(image) = image_from_response(retry, &candidate, is_scrambled) {
+				if let Some(image) = retry_page_image(&candidate, is_scrambled, 0) {
 					return Ok(image);
 				}
 			}
@@ -667,6 +672,39 @@ fn page_image_request(url: &str) -> Result<Request> {
 	Ok(Request::get(url)?
 		.header("Accept", "*/*")
 		.header("User-Agent", IMAGE_USER_AGENT))
+}
+
+const IMAGE_RETRY_ATTEMPTS: u8 = 10;
+
+fn is_retryable_image_status(code: u16) -> bool {
+	code == 404 || (500..600).contains(&code)
+}
+
+fn image_retry_url(url: &str, attempt: u8) -> String {
+	let separator = if url.contains('?') { '&' } else { '?' };
+	format!("{url}{separator}r={attempt}")
+}
+
+fn retry_page_image(url: &str, is_scrambled: bool, first_attempt: u8) -> Option<ImageRef> {
+	for attempt in first_attempt..=IMAGE_RETRY_ATTEMPTS {
+		let candidate = if attempt == 0 {
+			url.to_string()
+		} else {
+			image_retry_url(url, attempt)
+		};
+		let Ok(response) = page_image_request(&candidate).and_then(|request| Ok(request.send()?))
+		else {
+			continue;
+		};
+		let code = response.status_code();
+		if (200..400).contains(&code) {
+			return image_from_response(response, &candidate, is_scrambled);
+		}
+		if code != 404 && !(500..600).contains(&code) {
+			break;
+		}
+	}
+	None
 }
 
 fn finalize_page_image(response: ImageResponse, is_scrambled: bool) -> ImageRef {
@@ -896,7 +934,7 @@ fn build_lcg_order(seed: i32, count: usize) -> Vec<usize> {
 }
 
 /// Alternate CDN path segments used by current and older Comix chapter payloads.
-const IMAGE_PATH_SEGMENTS: &[&str] = &["/fcf/", "/i5/", "/si/", "/i/", "/sii/", "/ii/", "/hi/"];
+const IMAGE_PATH_SEGMENTS: &[&str] = &["/hi/", "/fcf/", "/i5/", "/si/", "/i/", "/sii/", "/ii/"];
 
 /// Returns fallback URLs by swapping the image path segment for each alternative.
 fn image_path_fallbacks(url: &str) -> Vec<String> {
@@ -1025,5 +1063,35 @@ mod tests {
 		);
 		assert!(fallbacks.contains(&"https://cdn.example/i5/page.webp?r=2".into()));
 		assert!(!fallbacks.iter().any(|url| url.contains("/hi/")));
+	}
+
+	#[aidoku_test]
+	fn prioritizes_hi_image_fallback() {
+		let fallbacks = image_path_fallbacks("https://cdn.example/ii/page.webp");
+		assert_eq!(
+			fallbacks.first().map(String::as_str),
+			Some("https://cdn.example/hi/page.webp")
+		);
+	}
+
+	#[aidoku_test]
+	fn builds_cache_busting_image_urls() {
+		assert_eq!(
+			image_retry_url("https://cdn.example/page.webp", 3),
+			"https://cdn.example/page.webp?r=3"
+		);
+		assert_eq!(
+			image_retry_url("https://cdn.example/page.webp?v3", 3),
+			"https://cdn.example/page.webp?v3&r=3"
+		);
+	}
+
+	#[aidoku_test]
+	fn retries_only_missing_or_server_error_images() {
+		assert!(is_retryable_image_status(404));
+		assert!(is_retryable_image_status(500));
+		assert!(is_retryable_image_status(599));
+		assert!(!is_retryable_image_status(403));
+		assert!(!is_retryable_image_status(429));
 	}
 }
