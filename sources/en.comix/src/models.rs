@@ -326,6 +326,7 @@ pub struct ScanlationGroup {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComixPages {
+	#[serde(default, alias = "base_url")]
 	pub base_url: String,
 	pub items: Vec<ComixPage>,
 }

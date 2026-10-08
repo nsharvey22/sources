@@ -325,7 +325,14 @@ impl Source for Comix {
 			bail!("Missing chapter")
 		};
 
-		let base_url = result.pages.base_url.trim_end_matches('/');
+		// New page payloads contain absolute item URLs and omit baseUrl entirely. Keep the
+		// site URL as a fallback for older relative payloads while accepting both schemas.
+		let base_url = if result.pages.base_url.is_empty() {
+			settings::base_url()
+		} else {
+			result.pages.base_url
+		};
+		let base_url = base_url.trim_end_matches('/');
 		Ok(result
 			.pages
 			.items
@@ -1093,5 +1100,16 @@ mod tests {
 		assert!(is_retryable_image_status(599));
 		assert!(!is_retryable_image_status(403));
 		assert!(!is_retryable_image_status(429));
+	}
+
+	#[aidoku_test]
+	fn accepts_page_payload_without_base_url() {
+		let response: ChapterResponse = serde_json::from_str(
+			r#"{"result":{"pages":{"items":[{"url":"https://cdn.example/hi/page.webp","width":720,"height":1280,"s":0}]}}}"#,
+		)
+		.unwrap();
+		let pages = response.result.unwrap().pages;
+		assert!(pages.base_url.is_empty());
+		assert_eq!(pages.items.len(), 1);
 	}
 }
