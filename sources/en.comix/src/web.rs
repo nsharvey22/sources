@@ -248,36 +248,122 @@ const CHAPTER_CAPTURE_JS: &str = r#"(() => {
 				match => match[1]
 			);
 			const importBundle = new Function('url', 'return import(url)');
-			let mangaApi = null;
+			let fetchChapterPage = null;
 			for (const bundleFile of bundleFiles) {
 				const bundle = await importBundle(
 					new URL(bundleFile, mainScriptUrl).href
 				);
-				mangaApi = Object.values(bundle).find(value =>
+				const legacyApi = Object.values(bundle).find(value =>
 					value && typeof value === 'object' && typeof value.chapters === 'function'
 				);
-				if (mangaApi) break;
+				if (legacyApi) {
+					fetchChapterPage = legacyApi.chapters.bind(legacyApi);
+					break;
+				}
+				// The current build mangles the manga API and response property names. This
+				// combination identifies the manga client among the exported API objects.
+				const minifiedApi = Object.values(bundle).find(value =>
+					value && typeof value === 'object' &&
+					typeof value.mL === 'function' &&
+					typeof value.RK === 'function' &&
+					typeof value.qR === 'function'
+				);
+				if (minifiedApi) {
+					fetchChapterPage = minifiedApi.mL.bind(minifiedApi);
+					break;
+				}
 			}
-			if (!mangaApi) throw new Error('Could not find manga API');
+			if (!fetchChapterPage) throw new Error('Could not find manga API');
 			const items = [];
 			let page = 1;
 			while (page <= 200) {
-				const response = await mangaApi.chapters(mangaId, {
+				const response = await fetchChapterPage(mangaId, {
 					page,
 					limit: 100,
 					order: { number: 'desc' }
 				});
-				const pageItems = response && response.items;
+				const rawItems = response && (response.items || response.LG);
+				const pageItems = Array.isArray(rawItems) ? rawItems.map(item => {
+					if (item && item.id !== undefined) return item;
+					return {
+						id: item.Xn,
+						number: item.X3,
+						name: item.Wo || '',
+						votes: item['K$'] || 0,
+						createdAtFormatted: item.kg || '',
+						group: item.xf ? {
+							id: item.xf.vH,
+							name: item.xf.Wo
+						} : null,
+						isOfficial: item.SE || false,
+						url: item.bZ || ''
+					};
+				}) : rawItems;
 				if (!Array.isArray(pageItems) || pageItems.length === 0) break;
 				items.push(...pageItems);
-				const meta = response.meta || response.pagination || {};
-				const lastPage = meta.lastPage || meta.last_page || page;
-				if (!(meta.hasNext || page < lastPage)) break;
+				const meta = response.meta || response.pagination || response.aZ || {};
+				const lastPage = meta.lastPage || meta.last_page || meta.er || page;
+				if (!(meta.hasNext || meta.ZF || page < lastPage)) break;
 				page++;
 			}
 			window.__aidokuChapterPayload = JSON.stringify(items);
 		} catch (error) {
 			window.__aidokuChapterError = String(error && error.message || error);
+		}
+	})();
+	return '';
+})()"#;
+
+const PAGE_CAPTURE_JS: &str = r#"(() => {
+	window.__aidokuPagePayload = '';
+	window.__aidokuCaptureError = '';
+	(async () => {
+		try {
+			const chapterId = Number(
+				window.location.pathname.match(/\/(\d+)-chapter-/)?.[1] || 0
+			);
+			if (!chapterId) throw new Error('Could not find chapter id');
+			const mainScriptUrl = document.querySelector(
+				'script[type="module"][src*="/dist/main-"]'
+			)?.src || '';
+			if (!mainScriptUrl) throw new Error('Could not find main bundle');
+			const mainResponse = await fetch(mainScriptUrl);
+			if (!mainResponse.ok) throw new Error('Could not load main bundle');
+			const mainJavaScript = await mainResponse.text();
+			const bundleFiles = Array.from(
+				mainJavaScript.matchAll(/from\s*["']\.\/([^"']+\.js)["']/g),
+				match => match[1]
+			);
+			const importBundle = new Function('url', 'return import(url)');
+			let httpClient = null;
+			let apiRoutes = null;
+			for (const bundleFile of bundleFiles) {
+				const bundle = await importBundle(
+					new URL(bundleFile, mainScriptUrl).href
+				);
+				const values = Object.values(bundle);
+				httpClient ||= values.find(value =>
+					value && typeof value === 'object' &&
+					typeof value.Vk === 'function' && typeof value.xN === 'function'
+				);
+				apiRoutes ||= values.find(value => {
+					if (!value || typeof value !== 'object' ||
+						typeof value.mL?.qR !== 'function') return false;
+					try {
+						const route = value.mL.qR(chapterId);
+						return typeof route === 'string' && route.includes('/chapters/');
+					} catch (_) {
+						return false;
+					}
+				});
+				if (httpClient && apiRoutes) break;
+			}
+			if (!httpClient || !apiRoutes) throw new Error('Could not find chapter API');
+			const chapter = await httpClient.Vk(apiRoutes.mL.qR(chapterId));
+			if (!chapter || !chapter.pages) throw new Error('Chapter response has no pages');
+			window.__aidokuPagePayload = JSON.stringify({ result: chapter });
+		} catch (error) {
+			window.__aidokuCaptureError = String(error && error.message || error);
 		}
 	})();
 	return '';
@@ -542,6 +628,7 @@ impl ComixWebView {
 	pub fn fetch_pages(&self, url: &str) -> Result<ChapterResponse> {
 		Self::get_html(url)?;
 		let web_view = Self::capture_webview(url)?;
+		web_view.eval(PAGE_CAPTURE_JS)?;
 		let payload =
 			Self::wait_for_payload(&web_view, "__aidokuPagePayload", "__aidokuCaptureError")?;
 		serde_json::from_str(&payload).map_err(|e| error!("Invalid page data: {e}"))
