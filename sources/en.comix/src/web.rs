@@ -237,12 +237,12 @@ const CHAPTER_CAPTURE_JS: &str = r#"(() => {
 	window.__aidokuChapterPayload = '';
 	window.__aidokuChapterError = '';
 	const chapters = [];
-	const received = new Map();
 	const chapterPath = __AIDOKU_CHAPTER_PATH__;
-	let lastPage = null;
-	let nextToRead = 1;
-	let nextToRequest = 2;
+	const pageDelayMs = 500;
+	const pagerFallbackMs = 3000;
+	let page = 1;
 	let done = false;
+	let timeoutId = null;
 	const fail = message => {
 		done = true;
 		window.__aidokuChapterError = String(message);
@@ -251,28 +251,11 @@ const CHAPTER_CAPTURE_JS: &str = r#"(() => {
 		done = true;
 		window.__aidokuChapterPayload = JSON.stringify(chapters);
 	};
-	const advance = () => {
-		while (received.has(nextToRead)) {
-			const { items, meta } = received.get(nextToRead);
-			received.delete(nextToRead);
-			chapters.push(...items);
-			if (!meta.hasNext || nextToRead >= lastPage) {
-				const count = new Set(chapters.map(item => item.id)).size;
-				if (typeof meta.total !== 'number' || count === meta.total) finish();
-				else fail(`Got ${count} of ${meta.total} chapters`);
-				return;
-			}
-			nextToRead++;
-		}
-		while (nextToRequest <= lastPage && nextToRequest < nextToRead + 4) {
-			const page = nextToRequest++;
-			setTimeout(() => {
-				const url = new URL(location.href);
-				url.searchParams.set('page', String(page));
-				history.pushState(history.state, '', url);
-				dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
-			});
-		}
+	const armTimeout = () => {
+		clearTimeout(timeoutId);
+		timeoutId = setTimeout(() => {
+			if (!done) fail('Timed out waiting for Comix chapter data');
+		}, 30000);
 	};
 	const capture = holder => {
 		try {
@@ -287,10 +270,33 @@ const CHAPTER_CAPTURE_JS: &str = r#"(() => {
 				fail('Chapter list has no page numbers');
 				return;
 			}
-			if (meta.page < nextToRead || received.has(meta.page)) return;
-			if (lastPage === null) lastPage = Math.min(meta.lastPage, 1000);
-			received.set(meta.page, { items, meta });
-			advance();
+			if (meta.page !== page) return;
+			armTimeout();
+			chapters.push(...items);
+			if (!meta.hasNext || page >= Math.min(meta.lastPage, 1000)) {
+				const count = new Set(chapters.map(item => item.id)).size;
+				if (typeof meta.total !== 'number' || count === meta.total) finish();
+				else fail(`Got ${count} of ${meta.total} chapters`);
+				return;
+			}
+			page++;
+			const target = page;
+			const clickPage = tries => {
+				if (done || page !== target) return;
+				const button = Array.from(document.querySelectorAll(
+					'.mpage__chapters nav.npager button.npager__num'
+				)).find(button => button.textContent.trim() === String(target));
+				if (button) button.click();
+				else if (tries > 0) setTimeout(() => clickPage(tries - 1), 200);
+				else fail(`Chapter list pager has no page ${target}`);
+			};
+			setTimeout(() => {
+				const url = new URL(location.href);
+				url.searchParams.set('page', String(target));
+				history.pushState(history.state, '', url);
+				dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+				setTimeout(() => clickPage(25), pagerFallbackMs);
+			}, pageDelayMs);
 		} catch (error) {
 			fail(error && error.message || error);
 		}
@@ -312,9 +318,7 @@ const CHAPTER_CAPTURE_JS: &str = r#"(() => {
 		}
 		return result;
 	};
-	setTimeout(() => {
-		if (!done) fail('Timed out waiting for Comix chapter data');
-	}, 30000);
+	armTimeout();
 	return '';
 })()"#;
 
