@@ -238,7 +238,7 @@ const CHAPTER_CAPTURE_JS: &str = r#"(() => {
 	window.__aidokuChapterError = '';
 	const chapters = [];
 	const chapterPath = __AIDOKU_CHAPTER_PATH__;
-	const pageDelayMs = 500;
+	const pageDelayMs = 1500;
 	const pagerFallbackMs = 3000;
 	let page = 1;
 	let done = false;
@@ -254,7 +254,7 @@ const CHAPTER_CAPTURE_JS: &str = r#"(() => {
 	const armTimeout = () => {
 		clearTimeout(timeoutId);
 		timeoutId = setTimeout(() => {
-			if (!done) fail('Timed out waiting for Comix chapter data');
+			if (!done) fail(`Timed out waiting for Comix chapter data at page ${page}`);
 		}, 30000);
 	};
 	const capture = holder => {
@@ -286,7 +286,10 @@ const CHAPTER_CAPTURE_JS: &str = r#"(() => {
 				const button = Array.from(document.querySelectorAll(
 					'.mpage__chapters nav.npager button.npager__num'
 				)).find(button => button.textContent.trim() === String(target));
-				if (button) button.click();
+				if (button) {
+					button.click();
+					if (tries > 0) setTimeout(() => clickPage(tries - 1), 2000);
+				}
 				else if (tries > 0) setTimeout(() => clickPage(tries - 1), 200);
 				else fail(`Chapter list pager has no page ${target}`);
 			};
