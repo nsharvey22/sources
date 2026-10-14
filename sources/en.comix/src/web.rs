@@ -376,6 +376,13 @@ struct AxiosRequest {
 }
 
 #[derive(Deserialize)]
+struct FetchResult {
+	status: u16,
+	cf: Option<String>,
+	data: Option<Value>,
+}
+
+#[derive(Deserialize)]
 #[allow(dead_code)]
 struct DescrambleResponseObject {
 	data: Option<String>,
@@ -852,6 +859,66 @@ impl ComixWebView {
 	}
 
 	pub fn build_request(&mut self, url: &str) -> Result<Request> {
+		create_request_get(&self.sign_url(url)?)
+	}
+
+	/// Fetches signed API data inside WebKit so Comix's `waf_pass` cookie is sent from the
+	/// same browser context that completed the challenge. CFNetwork requests do not reliably
+	/// receive that cookie on current iOS releases.
+	pub fn fetch_json<T>(&mut self, url: &str) -> Result<T>
+	where
+		T: DeserializeOwned,
+	{
+		let url = self.sign_url(url)?;
+		let url_literal =
+			serde_json::to_string(&url).map_err(|e| error!("Failed to encode signed URL: {e}"))?;
+		let result = self.web_view.eval(&format!(
+			"(() => {{
+				const xhr = new XMLHttpRequest();
+				xhr.open('GET', {url_literal}, false);
+				xhr.send();
+				const enc = xhr.getResponseHeader('x-enc');
+				let data = null;
+				try {{
+					data = JSON.parse(xhr.responseText);
+				}} catch (_) {{}}
+				if (enc && xhr.status === 200) {{
+					const decoded = window['{INSTALLER_RESPONSE_TOKEN}']({{
+						data,
+						status: 200,
+						headers: {{ 'x-enc': enc }},
+					}});
+					data = {{ result: decoded && decoded.data }};
+				}}
+				return JSON.stringify({{
+					status: xhr.status,
+					cf: xhr.getResponseHeader('cf-mitigated'),
+					data,
+				}});
+			}})()"
+		))?;
+
+		let fetched: FetchResult =
+			serde_json::from_str(&result).map_err(|e| error!("Invalid WebView response: {e}"))?;
+		if fetched.status == 403
+			&& (fetched.cf.as_deref() == Some("challenge")
+				|| fetched
+					.data
+					.as_ref()
+					.and_then(|data| data.get("error"))
+					.and_then(Value::as_str)
+					== Some(WAF_CHALLENGE_KEY))
+		{
+			bail!("{WAF_CHALLENGE_ERROR_MESSAGE}")
+		} else if !(200..300).contains(&fetched.status) {
+			bail!("Response Error: {}", fetched.status)
+		}
+
+		serde_json::from_value(fetched.data.unwrap_or_default())
+			.map_err(|e| error!("Invalid json: {e}"))
+	}
+
+	fn sign_url(&mut self, url: &str) -> Result<String> {
 		if !self.has_signer() {
 			self.load_webview()?
 		}
@@ -960,9 +1027,9 @@ impl ComixWebView {
 
 		if let Some(params) = axios_request.params {
 			let query = build_query(&params);
-			create_request_get(&format!("{}?{query}", axios_request.url))
+			Ok(format!("{}?{query}", axios_request.url))
 		} else {
-			create_request_get(&axios_request.url)
+			Ok(axios_request.url)
 		}
 	}
 

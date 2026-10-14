@@ -1,6 +1,6 @@
 use aidoku::{
 	alloc::{format, string::String, vec::Vec},
-	imports::defaults::{DefaultValue, defaults_get, defaults_set},
+	imports::defaults::{DefaultValue, defaults_get, defaults_get_map, defaults_set},
 };
 
 const BASE_URL_KEY: &str = "baseUrl";
@@ -9,6 +9,8 @@ const MIRROR_BASE_URL: &str = "https://comix.ws";
 const HIDE_NSFW_KEY: &str = "hideNSFW";
 const THUMBNAIL_QUALITY_KEY: &str = "thumbnailQuality";
 const DEDUPED_CHAPTER_KEY: &str = "dedupedChapter";
+pub const VERIFY_KEY: &str = "verify";
+pub const VERIFY_COOKIE_KEY: &str = "waf_pass";
 
 const HIDDEN_TYPES_KEY: &str = "hiddenTypes";
 const HIDDEN_GENRES_KEY: &str = "hiddenGenres";
@@ -35,6 +37,12 @@ pub fn image_quality() -> String {
 
 pub fn dedupchapter() -> bool {
 	defaults_get::<bool>(DEDUPED_CHAPTER_KEY).unwrap_or(false)
+}
+
+pub fn get_verify_cookie() -> Option<String> {
+	defaults_get_map(VERIFY_KEY)?
+		.get(VERIFY_COOKIE_KEY)
+		.cloned()
 }
 
 pub fn hidden_types() -> Vec<String> {

@@ -4,6 +4,7 @@ use aidoku::{
 	HomeLayout, HomePartialResult, ImageRequest, ImageRequestProvider, ImageResponse, Link,
 	LinkValue, Listing, ListingProvider, Manga, MangaPageResult, MangaWithChapter,
 	NotificationHandler, Page, PageContent, PageContext, PageImageProcessor, Result, Source,
+	WebLoginHandler,
 	alloc::{String, Vec, string::ToString, vec},
 	helpers::uri::{QueryParameters, encode_uri_component},
 	imports::{
@@ -225,18 +226,10 @@ impl Source for Comix {
 			);
 			let page_url =
 				selected_source_url(manga.url.as_deref(), &format!("title/{}", manga.key));
-			let detail = if web_view.has_signer() {
-				web_view
-					.build_request(&signed_url)
-					.and_then(|request| Ok(request.send()?))
-					.and_then(|response| {
-						web_view.decode_json_owned::<SingleMangaResponse>(&response)
-					})
-					.map(|response| response.result)
-					.or_else(|_| web_view.fetch_manga(&page_url))?
-			} else {
-				web_view.fetch_manga(&page_url)?
-			};
+			let detail = web_view
+				.fetch_json::<SingleMangaResponse>(&signed_url)
+				.map(|response| response.result)
+				.or_else(|_| web_view.fetch_manga(&page_url))?;
 
 			manga.copy_from(detail.into());
 
@@ -250,7 +243,6 @@ impl Source for Comix {
 			let mut chapter_map: HashMap<String, ComixChapter> = HashMap::new();
 			let page_url =
 				selected_source_url(manga.url.as_deref(), &format!("title/{}", manga.key));
-			let has_signer = web_view.has_signer();
 			let mut fetch_signed = || -> Result<Vec<ComixChapter>> {
 				let mut page = 1;
 				let mut chapters = Vec::new();
@@ -260,9 +252,7 @@ impl Source for Comix {
 					params.push("page", Some(page.to_string().as_str()));
 					params.push("order[number]", Some("desc"));
 					let url = format!("{api_url}/manga/{}/chapters?{params}", manga.key);
-					let response = web_view.build_request(&url)?.send()?;
-					let response =
-						web_view.decode_json_owned::<ChapterDetailsResponse>(&response)?;
+					let response = web_view.fetch_json::<ChapterDetailsResponse>(&url)?;
 					let last_page = response.result.meta.last_page;
 					chapters.extend(response.result.items);
 					if page >= last_page {
@@ -272,11 +262,8 @@ impl Source for Comix {
 				}
 				Ok(chapters)
 			};
-			let mut chapter_list = if has_signer {
-				fetch_signed().or_else(|_| web_view.fetch_chapters(&page_url, &manga.key))?
-			} else {
-				web_view.fetch_chapters(&page_url, &manga.key)?
-			};
+			let mut chapter_list =
+				fetch_signed().or_else(|_| web_view.fetch_chapters(&page_url, &manga.key))?;
 
 			if deduplicate {
 				for item in chapter_list.drain(..) {
@@ -311,15 +298,9 @@ impl Source for Comix {
 			chapter.url.as_deref(),
 			&format!("title/{}/{}", manga.key, chapter.key),
 		);
-		let json = if web_view.has_signer() {
-			web_view
-				.build_request(&signed_url)
-				.and_then(|request| Ok(request.send()?))
-				.and_then(|response| web_view.decode_json_owned::<ChapterResponse>(&response))
-				.or_else(|_| web_view.fetch_pages(&page_url))?
-		} else {
-			web_view.fetch_pages(&page_url)?
-		};
+		let json = web_view
+			.fetch_json::<ChapterResponse>(&signed_url)
+			.or_else(|_| web_view.fetch_pages(&page_url))?;
 
 		let Some(result) = json.result else {
 			bail!("Missing chapter")
@@ -999,6 +980,31 @@ impl DeepLinkHandler for Comix {
 	}
 }
 
+impl WebLoginHandler for Comix {
+	fn handle_web_login(&self, key: String, cookies: HashMap<String, String>) -> Result<bool> {
+		if key != settings::VERIFY_KEY {
+			return Ok(false);
+		}
+
+		// The challenge cookie format changed and no longer exposes a reliable timestamp.
+		// Validate it against a small authenticated API request instead.
+		if cookies
+			.get(settings::VERIFY_COOKIE_KEY)
+			.is_none_or(|pass| pass.is_empty())
+		{
+			return Ok(false);
+		}
+
+		self.web_view
+			.borrow_mut()
+			.fetch_json::<serde_json::Value>(&format!(
+				"{}/manga/pvry/chapters?limit=1",
+				settings::api_url()
+			))
+			.map(|_| true)
+	}
+}
+
 register_source!(
 	Comix,
 	Home,
@@ -1006,7 +1012,8 @@ register_source!(
 	ImageRequestProvider,
 	PageImageProcessor,
 	NotificationHandler,
-	DeepLinkHandler
+	DeepLinkHandler,
+	WebLoginHandler
 );
 
 #[cfg(test)]

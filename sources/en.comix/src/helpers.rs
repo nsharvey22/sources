@@ -11,10 +11,17 @@ use aidoku::{
 
 pub fn create_request_get(url: &str) -> Result<Request> {
 	let base_url = settings::base_url();
-	Ok(Request::get(url)?
+	let mut request = Request::get(url)?
 		.header("Accept", "*/*")
 		.header("Referer", &format!("{base_url}/"))
-		.header("Origin", &base_url))
+		.header("Origin", &base_url);
+	if let Some(token) = settings::get_verify_cookie() {
+		request = request.header(
+			"Cookie",
+			&format!("{}={token}", settings::VERIFY_COOKIE_KEY),
+		);
+	}
+	Ok(request)
 }
 
 fn is_official_like(ch: &ComixChapter) -> bool {
