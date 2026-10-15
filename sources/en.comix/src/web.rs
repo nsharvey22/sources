@@ -11,6 +11,7 @@ use aidoku::{
 	imports::{
 		js::WebView,
 		net::{Request, Response},
+		std::sleep,
 	},
 	prelude::*,
 };
@@ -53,8 +54,31 @@ const EMPTY_DESCRAMBLER_RESPONSE_OBJECT: &str =
 const FETCH_TIMEOUT_RESPONSE: &str =
 	"Fetch timeout after 30s. If problem persist, please restart the application.";
 
-const JS_PATCHER: &str = "<head>\
-<script>window['__AIDOKU_CANVAS_TO_DATA_URL_TOKEN__'] = HTMLCanvasElement.prototype.toDataURL;</script>";
+// Comix raises X-Rt after several API calls without user input, then rejects requests carrying
+// the flag. Install this before the application scripts so both site-driven requests and the
+// source's WebView requests keep the flag at zero.
+const X_RT_PATCH_JS: &str = r#"
+if (!window.__aidokuXrtPatched) {
+	window.__aidokuXrtPatched = true;
+	const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+	XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+		if (String(name).toLowerCase() === 'x-rt' && String(value) === '1') value = '0';
+		return originalSetRequestHeader.call(this, name, value);
+	};
+}
+"#;
+
+const JS_PATCHER: &str = r#"<head><script>
+if (!window.__aidokuXrtPatched) {
+	window.__aidokuXrtPatched = true;
+	const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+	XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+		if (String(name).toLowerCase() === 'x-rt' && String(value) === '1') value = '0';
+		return originalSetRequestHeader.call(this, name, value);
+	};
+}
+window['__AIDOKU_CANVAS_TO_DATA_URL_TOKEN__'] = HTMLCanvasElement.prototype.toDataURL;
+</script>"#;
 
 const HTML_CAPTURE_SCRIPT: &str = r#"
 (() => {
@@ -238,7 +262,7 @@ const CHAPTER_CAPTURE_JS: &str = r#"(() => {
 	window.__aidokuChapterError = '';
 	const chapters = [];
 	const chapterPath = __AIDOKU_CHAPTER_PATH__;
-	const pageDelayMs = 1500;
+	const pageDelayMs = 2500;
 	const pagerFallbackMs = 3000;
 	let page = 1;
 	let done = false;
@@ -474,7 +498,8 @@ impl ComixWebView {
 
 	fn capture_site_data_webview(url: &str, capture_script: &str) -> Result<WebView> {
 		let html = Self::get_html(url)?;
-		let bootstrap = format!("<head><script>{capture_script}</script>");
+		let bootstrap =
+			format!("<head><script>{X_RT_PATCH_JS}</script><script>{capture_script}</script>");
 		let patched_html = html.replacen("<head>", &bootstrap, 1);
 		if patched_html.len() == html.len() {
 			bail!("Could not install Comix data capture")
@@ -916,6 +941,13 @@ impl ComixWebView {
 
 		serde_json::from_value(fetched.data.unwrap_or_default())
 			.map_err(|e| error!("Invalid json: {e}"))
+	}
+
+	/// Comix rejects chapter-list clients that walk pages too quickly. The host sleep API has
+	/// whole-second resolution, so use three seconds as the safe equivalent of the site's 2.5s
+	/// minimum interval.
+	pub fn pace_chapter_request() {
+		sleep(3);
 	}
 
 	fn sign_url(&mut self, url: &str) -> Result<String> {

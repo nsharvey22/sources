@@ -250,7 +250,7 @@ impl Source for Comix {
 					let mut params = QueryParameters::new();
 					params.push("limit", Some("100"));
 					params.push("page", Some(page.to_string().as_str()));
-					params.push("order[number]", Some("desc"));
+					params.push("order[created_at]", Some("desc"));
 					let url = format!("{api_url}/manga/{}/chapters?{params}", manga.key);
 					let response = web_view.fetch_json::<ChapterDetailsResponse>(&url)?;
 					let last_page = response.result.meta.last_page;
@@ -259,6 +259,7 @@ impl Source for Comix {
 						break;
 					}
 					page += 1;
+					ComixWebView::pace_chapter_request();
 				}
 				Ok(chapters)
 			};
