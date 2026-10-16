@@ -1,17 +1,5 @@
 [
 	{
-		"id": "author",
-		"type": "text",
-		"title": "Author",
-		"placeholder": "Author name"
-	},
-	{
-		"id": "artist",
-		"type": "text",
-		"title": "Artist",
-		"placeholder": "Artist name"
-	},
-	{
 		"id": "sortBy",
 		"type": "sort",
 		"title": "Sort",
@@ -27,8 +15,28 @@
 		],
 		"default": {
 			"index": 0,
-			"ascending": true
+			"ascending": false
 		}
+	},
+	{
+		"id": "origin",
+		"type": "multi-select",
+		"title": "Type",
+		"canExclude": false,
+		"options": [
+			"Manga",
+			"Manhwa",
+			"Manhua",
+			"OEL",
+			"One Shot"
+		],
+		"ids": [
+			"JP",
+			"KR",
+			"CN",
+			"EN",
+			"ONESHOT"
+		]
 	},
 	{
 		"id": "status",
@@ -42,32 +50,31 @@
 		]
 	},
 	{
-		"id": "volumes",
+		"id": "scanlator",
 		"type": "select",
-		"title": "Volume",
+		"title": "Scanlator",
 		"options": [
 			"Any",
-			"Has Volumes",
-			"No Volumes"
+			"Scanlator Group",
+			"No Scanlator Group"
+		],
+		"ids": [
+			"any",
+			"with",
+			"without"
 		]
 	},
 	{
-		"id": "origin",
-		"type": "multi-select",
-		"title": "Type",
-		"canExclude": false,
-		"options": [
-			"Manga",
-			"Manhwa",
-			"Manhua",
-			"One Shot"
-		],
-		"ids": [
-			"JP",
-			"KR",
-			"CN",
-			"ONESHOT"
-		]
+		"id": "author",
+		"type": "text",
+		"title": "Author",
+		"placeholder": "Author name"
+	},
+	{
+		"id": "artist",
+		"type": "text",
+		"title": "Artist",
+		"placeholder": "Artist name"
 	},
 	{
 		"id": "genre",
@@ -120,6 +127,7 @@
 			"Boys Love",
 			"Bully",
 			"Business",
+			"Child Abuse",
 			"Comic",
 			"crossdressing",
 			"Crossdressing",
@@ -157,10 +165,13 @@
 			"Manhwa",
 			"Mature",
 			"Medieval Area",
+			"MILF",
 			"Military",
 			"Monster Girls",
 			"Monsters",
+			"Murim",
 			"Ninja",
+			"Nobility",
 			"Office Romance",
 			"Office Worker",
 			"Office Workers",
@@ -172,9 +183,11 @@
 			"Police",
 			"Politics",
 			"Post-Apocalyptic",
+			"Regression",
 			"Reincarnation",
 			"Revenge",
 			"Reverse Harem",
+			"Royalty",
 			"Samurai",
 			"School",
 			"Seinin",
@@ -196,10 +209,88 @@
 			"Virtual Reality",
 			"War",
 			"Webtoon",
+			"Workplace",
 			"Wuxia",
 			"Yaoi",
 			"Yuri",
 			"Zombies"
+		]
+	},
+	{
+		"id": "content_rating",
+		"type": "multi-select",
+		"title": "Content Rating",
+		"canExclude": true,
+		"options": [
+			"Safe",
+			"Suggestive",
+			"Erotica",
+			"Pornographic"
+		],
+		"ids": [
+			"safe",
+			"suggestive",
+			"erotica",
+			"pornographic"
+		],
+		"defaultIncluded": [
+			"safe",
+			"suggestive"
+		]
+	},
+	{
+		"id": "min_rating",
+		"type": "select",
+		"title": "Rating",
+		"options": [
+			"Any",
+			"5+",
+			"6+",
+			"7+",
+			"8+",
+			"9+"
+		],
+		"ids": [
+			"any",
+			"5",
+			"6",
+			"7",
+			"8",
+			"9"
+		]
+	},
+	{
+		"id": "min_chapters",
+		"type": "select",
+		"title": "Chapters",
+		"options": [
+			"Any",
+			"10+",
+			"25+",
+			"50+",
+			"100+"
+		],
+		"ids": [
+			"any",
+			"10",
+			"25",
+			"50",
+			"100"
+		]
+	},
+	{
+		"id": "volumes",
+		"type": "select",
+		"title": "Volume",
+		"options": [
+			"Any",
+			"Has Volumes",
+			"No Volumes"
+		],
+		"ids": [
+			"any",
+			"with",
+			"without"
 		]
 	}
 ]

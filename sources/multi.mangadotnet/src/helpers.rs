@@ -1,6 +1,7 @@
+use crate::settings::get_cloudflare_cookie;
 use crate::{
-	BASE_URL, LOGIN_COOKIE_KEY, models::MangaChapter, models::PageContainer, models::UserProfile,
-	settings::get_deduped_group_list, settings::get_login_cookie,
+	BASE_URL, CLOUDFLARE_COOKIE_KEY, LOGIN_COOKIE_KEY, models::MangaChapter, models::PageContainer,
+	models::UserProfile, settings::get_deduped_group_list, settings::get_login_cookie,
 };
 use aidoku::{
 	HashMap, Result,
@@ -14,13 +15,28 @@ use aidoku::{
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
-const CF_CHALLENGE_ERROR_MESSAGE: &str = "Response returned CF challenge page instead of JSON data. If problem persist, please clear the source cache and restart the application to resolve this issue.";
+const CF_CHALLENGE_ERROR_MESSAGE: &str = "Response returned CF challenge page instead of JSON data. If problem persist, please clear the source cache and use the Resolve Cloudflare button instead.";
 
-fn create_request_get(url: &str) -> Result<Request> {
+fn create_request_get(url: &str, user_agent: &str) -> Result<Request> {
 	let mut request = Request::get(url)?;
-	if let Some(token) = get_login_cookie() {
-		request = request.header("Cookie", &format!("{LOGIN_COOKIE_KEY}={token}"));
+	let mut cookies = Vec::<String>::new();
+
+	if !user_agent.is_empty() {
+		request = request.header("User-Agent", user_agent);
 	}
+
+	if let Some(token) = get_login_cookie() {
+		cookies.push(format!("{LOGIN_COOKIE_KEY}={token}"));
+	}
+
+	if let Some(token) = get_cloudflare_cookie() {
+		cookies.push(format!("{CLOUDFLARE_COOKIE_KEY}={token}"));
+	}
+
+	if !cookies.is_empty() {
+		request = request.header("Cookie", &cookies.join(";"));
+	}
+
 	Ok(request)
 }
 
@@ -30,27 +46,37 @@ fn response_is_ok(response: &Response) -> Result<()> {
 		.is_some_and(|value| value == "challenge")
 	{
 		bail!("{CF_CHALLENGE_ERROR_MESSAGE}")
+	} else if response.status_code() == 503 {
+		bail!("Website is under maintenance. Please try again later :)");
+	} else if response.status_code() == 429 {
+		if let Some(duration) = response.get_header("Retry-After") {
+			bail!("Rate limited. Please wait for {duration} seconds before trying again.");
+		} else {
+			bail!("Rate limited. Please try again later.");
+		}
+	} else if response.status_code() == 401 {
+		bail!("Login token expired. Please re-login in the source settings.");
 	} else if response.status_code() >= 400 {
 		bail!("Response Error: {}", response.status_code())
 	}
 	Ok(())
 }
 
-pub fn get_json_data<T>(url: &str) -> Result<T>
+pub fn get_json_data<T>(url: &str, user_agent: &str) -> Result<T>
 where
 	T: DeserializeOwned,
 {
-	let request = create_request_get(url)?;
+	let request = create_request_get(url, user_agent)?;
 	let response = request.send()?;
 	response_is_ok(&response)?;
 	response.get_json_owned::<T>()
 }
 
-pub fn get_page_container_json_data<T>(url: &str) -> Result<T>
+pub fn get_page_container_json_data<T>(url: &str, user_agent: &str) -> Result<T>
 where
 	T: DeserializeOwned,
 {
-	let request = create_request_get(url)?;
+	let request = create_request_get(url, user_agent)?;
 	let response = request.send()?;
 	response_is_ok(&response)?;
 	handle_page_container_json_data_response(&response)
@@ -155,9 +181,9 @@ fn resolve_ptr_table_json(table: &[Value], index: usize) -> Result<Value> {
 	}
 }
 
-pub fn is_logged_in() -> bool {
+pub fn is_logged_in(user_agent: &str) -> bool {
 	get_login_cookie().is_some_and(|_| {
-		get_json_data::<UserProfile>("https://mangadot.net/api/profile")
+		get_json_data::<UserProfile>("https://mangadot.net/api/profile", user_agent)
 			.is_ok_and(|user_profile| user_profile.profile.is_some_and(|p| p.id.is_some()))
 	})
 }
@@ -171,46 +197,45 @@ pub fn base_url_join(uri: &str) -> String {
 }
 
 fn is_official_like(chapter: &MangaChapter) -> bool {
-	let official_group_ids = [
-		17423, // Official
-		18142, // Animate International
-		3521,  // Comikey
-		18516, // Dark Horse Manga
-		5952,  // FAKKU
-		3891,  // J-Novel Club
-		9438,  // Kodansha USA
-		18039, // Kodansha Comics
-		10712, // Manga Plus
-		18036, // Manga UP!
-		18180, // One Peace Books
-		18052, // Seven Seas Entertainment
-		18234, // Square Enix Manga
-		16861, // Viz Manga
-		17842, // VIZ Media
-		17841, // VIZ Shonen Jump
-		13541, // Yen Press
-		10887, // Manta
-		16168, // Tapas
-		16170, // TappyToon
-		10110, // LINE Webtoon
-		16424, // Toomics
+	let official_groups_names = [
+		"official",
+		"official?",
+		"animate international",
+		"comikey",
+		"dark horse manga",
+		"fakku",
+		"j-novel club",
+		"k-manga",
+		"k manga",
+		"kodansha usa",
+		"kodansha comics",
+		"manga plus",
+		"mangaplus",
+		"manga up!",
+		"one peace books",
+		"seven seas entertainment",
+		"square enix manga",
+		"viz manga",
+		"viz media",
+		"viz shonen jump",
+		"yen press",
+		"manta",
+		"tapas",
+		"tappytoon",
+		"line webtoon",
+		"toomics",
 	];
 
-	// There are probably others but tbh, they have not standardized this properly so this is
-	// only a small chunk that I know of. Wait for the site to mature better before optimizing
-	// this function. (And this only works for maybe 1% of the manga available)
-	let official_scanlator_names = ["Official", "Official?", "MangaPlus", "Comikey", "K-Manga"];
-
-	let group_ids = chapter
-		.groups
-		.as_ref()
-		.is_some_and(|groups| groups.iter().any(|g| official_group_ids.contains(&g.id)));
-
-	let scanlator_name = chapter.scanlator_name.as_ref().is_some_and(|name| {
-		official_scanlator_names
+	let group_ids = chapter.groups.as_ref().is_some_and(|groups| {
+		groups
 			.iter()
-			.any(|s| s.to_lowercase() == name.to_lowercase())
+			.any(|g| official_groups_names.contains(&g.name.to_lowercase().as_str()))
 	});
+
+	let scanlator_name = chapter
+		.scanlator_name
+		.as_ref()
+		.is_some_and(|name| official_groups_names.contains(&name.to_lowercase().as_str()));
 
 	group_ids || scanlator_name
 }
@@ -221,11 +246,9 @@ fn find_personal_group_preference_index(chapter: &MangaChapter) -> Option<usize>
 
 	if let Some(groups) = chapter.groups.as_ref() {
 		groups.iter().for_each(|g| {
-			index.push(
-				deduped_group_list
-					.iter()
-					.position(|p| p.eq(&g.id.to_string()) || p.eq(&g.name)),
-			);
+			index.push(deduped_group_list.iter().position(|p| {
+				p.eq(&g.id.to_string()) || p.to_lowercase().eq(&g.name.to_lowercase())
+			}));
 		});
 	}
 

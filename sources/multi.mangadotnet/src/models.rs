@@ -23,11 +23,6 @@ pub struct UserProfileData {
 }
 
 #[derive(Deserialize)]
-pub struct BookmarkPage {
-	pub data: BookmarkPageData,
-}
-
-#[derive(Deserialize)]
 pub struct BookmarkPageData {
 	pub total: i32,
 	pub page: i32,
@@ -66,10 +61,14 @@ pub struct ViewAllPageData {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SearchPage {
+	pub payload: Option<SearchPayload>,
+}
+
+#[derive(Deserialize)]
+pub struct SearchPayload {
+	pub manga_list: Option<Vec<ShortMangaItem>>,
 	pub pagination: Option<Pagination>,
-	pub results: Option<Vec<ShortMangaItem>>,
 }
 
 #[derive(Deserialize)]
@@ -92,6 +91,7 @@ pub struct ListingSectionData {
 pub struct Pagination {
 	pub current_page: i32,
 	pub total_pages: i32,
+	pub next_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -136,10 +136,10 @@ pub struct MangaItem {
 	pub artists: Option<StringOrVec>,
 	pub authors: Option<StringOrVec>,
 	pub status: String,
-	#[serde(deserialize_with = "bool_from_any")]
+	#[serde(default, deserialize_with = "bool_from_any")]
 	pub hiatus: bool,
 	pub content_rating: Option<String>,
-	#[serde(deserialize_with = "bool_from_any")]
+	#[serde(default, deserialize_with = "bool_from_any")]
 	pub is_adult: bool,
 	pub description: Option<String>,
 	pub genres: Option<Vec<String>>,
